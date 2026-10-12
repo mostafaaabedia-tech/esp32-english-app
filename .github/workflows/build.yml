@@ -9,20 +9,27 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
         with:
           node-version: 16
+
       - name: Install dependencies
         run: npm install
+
       - name: Install Expo CLI
         run: npx expo-cli install
+
       - name: Configure Expo
         run: npx expo export --platform android
+
       - name: Build APK
-        run: npx expo build:android -t apk --non-interactive --no-wait
+        run: npx expo build:android -t apk --non-interactive
+
       - name: Upload APK Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: speak-it-right-apk
-          path: android/app/build/outputs/apk/release/app-release.apk
+          path: android/app/build/outputs/**/*.apk
+          if-no-files-found: error
