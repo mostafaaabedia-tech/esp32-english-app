@@ -17,7 +17,8 @@
           "speechRecognitionPermission": "Speak It Right uses speech recognition to check your reading."
         }
       ],
-      "./plugins/withSpeechQueries"
+      "./plugins/withSpeechQueries",
+      "./plugins/withSplashColor"
     ],
     "android": {
       "package": "com.example.speakitright",
