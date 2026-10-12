@@ -8,6 +8,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      CI: "1"                      # enable non-interactive behavior
+      EAS_BUILD_PROFILE: preview   # optional, change to your profile from eas.json
     steps:
       - uses: actions/checkout@v4
 
@@ -16,20 +19,44 @@ jobs:
           node-version: 16
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
-      - name: Install Expo CLI
-        run: npx expo-cli install
+      - name: Install EAS CLI
+        run: npm install -g eas-cli@latest
 
-      - name: Configure Expo
-        run: npx expo export --platform android
+      - name: Start EAS build (cloud)
+        env:
+          EAS_TOKEN: ${{ secrets.EAS_TOKEN }}   # set this secret in repo settings
+        run: |
+          eas build --platform android --profile $EAS_BUILD_PROFILE --non-interactive --no-wait
+          # --no-wait returns immediately; remove --no-wait if you want to wait for completion
 
-      - name: Build APK
-        run: npx expo build:android -t apk --non-interactive
+      # Optional: wait for the latest finished build and download the APK URL (requires jq & curl)
+      - name: Wait & download latest finished APK URL
+        env:
+          EAS_TOKEN: ${{ secrets.EAS_TOKEN }}
+        run: |
+          # Install jq to parse JSON
+          sudo apt-get update && sudo apt-get install -y jq
+          # Poll for the latest finished build artifact and print the URL (10 checks)
+          for i in {1..10}; do
+            echo "Checking for finished builds (attempt $i)..."
+            builds_json=$(eas build:list --platform android --limit 5 --json)
+            apk_url=$(echo "$builds_json" | jq -r 'map(select(.status=="finished")) | .[0].artifacts.android.url // empty')
+            if [ -n "$apk_url" ]; then
+              echo "Found APK URL: $apk_url"
+              curl -L "$apk_url" -o app-latest.apk
+              ls -lh app-latest.apk
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "APK not available after polling; check the EAS build dashboard for details."
+          exit 1
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: speak-it-right-apk
-          path: android/app/build/outputs/**/*.apk
+          path: app-latest.apk
           if-no-files-found: error
