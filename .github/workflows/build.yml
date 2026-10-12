@@ -9,36 +9,37 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      CI: "1"                      # enable non-interactive behavior
-      EAS_BUILD_PROFILE: preview   # optional, change to your profile from eas.json
-    steps:
-      - uses: actions/checkout@v4
+      CI: "1"
+      EAS_BUILD_PROFILE: preview
 
-      - uses: actions/setup-node@v4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version: 16
+          node-version: 18
+          cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       - name: Install EAS CLI
         run: npm install -g eas-cli@latest
 
-      - name: Start EAS build (cloud)
+      - name: Start EAS build
         env:
-          EAS_TOKEN: ${{ secrets.EAS_TOKEN }}   # set this secret in repo settings
+          EAS_TOKEN: ${{ secrets.EAS_TOKEN }}
         run: |
-          eas build --platform android --profile $EAS_BUILD_PROFILE --non-interactive --no-wait
-          # --no-wait returns immediately; remove --no-wait if you want to wait for completion
+          eas build --platform android --profile "$EAS_BUILD_PROFILE" --non-interactive --no-wait
 
-      # Optional: wait for the latest finished build and download the APK URL (requires jq & curl)
       - name: Wait & download latest finished APK URL
         env:
           EAS_TOKEN: ${{ secrets.EAS_TOKEN }}
         run: |
-          # Install jq to parse JSON
-          sudo apt-get update && sudo apt-get install -y jq
-          # Poll for the latest finished build artifact and print the URL (10 checks)
+          sudo apt-get update
+          sudo apt-get install -y jq
           for i in {1..10}; do
             echo "Checking for finished builds (attempt $i)..."
             builds_json=$(eas build:list --platform android --limit 5 --json)
