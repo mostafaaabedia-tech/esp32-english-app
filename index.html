@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Speak-It-Right</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-container">
+        <h1>🗣️ Speak-It-Right</h1>
+        
+        <!-- New Bluetooth Connect Button -->
+        <button id="bleButton" onclick="connectBluetooth()">🔗 Connect to ESP32</button>
+        <p id="bleStatus" style="color: gray; font-size: 0.9rem;">Not Connected</p>
+
+        <div class="level-selector">
+            <button onclick="setLevel('Beginner')">Beginner</button>
+            <button onclick="setLevel('Intermediate')">Intermediate</button>
+            <button onclick="setLevel('Advanced')">Advanced</button>
+        </div>
+
+        <div class="sentence-card">
+            <p id="sentenceText">Select a level to start...</p>
+        </div>
+
+        <button id="micButton" onclick="startListening()">🎙️ Read Sentence</button>
+        <button id="nextButton" onclick="getRandomSentence()">Next Sentence</button>
+
+        <div id="resultText" class="result-box">Waiting for speech...</div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
