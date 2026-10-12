@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "name": "Speak It Right",
+    "slug": "speak-it-right",
+    "version": "1.0.0",
+    "platforms": ["android"],
+    "android": {
+      "package": "com.example.speakitright",
+      "permissions": [
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.RECORD_AUDIO"
+      ]
+    }
+  }
+}
