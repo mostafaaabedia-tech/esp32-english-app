@@ -9,6 +9,7 @@
   "dependencies": {
     "@react-native-voice/voice": "^3.2.4",
     "expo": "~51.0.0",
+    "expo-speech": "~12.0.2",
     "expo-status-bar": "~1.12.1",
     "react": "18.2.0",
     "react-native": "0.74.5",
