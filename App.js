@@ -13,6 +13,7 @@ import { DIFFICULTIES, STAGE_NAMES, stages } from './sentences';
 const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
 const CHAR_UUID = 'beb5483e-36e1-4688-b7f5-ea0730544b34';
 const SCAN_TIMEOUT_MS = 10000;
+const MAX_AUTO_RETRIES = 4; // how many times to silently restart the mic after "no speech / no match"
 
 // Base64 of the single characters 'c', 'w', 'r', 'v' (ble-plx needs base64 payloads).
 const COMMANDS = { correct: 'Yw==', wrong: 'dw==', reset: 'cg==', win: 'dg==' };
@@ -56,6 +57,31 @@ const pickFrom = (list, avoid) => {
     next = list[Math.floor(Math.random() * list.length)];
   }
   return next === avoid ? list[0] : next;
+};
+
+// Android SpeechRecognizer error codes arrive like { code: '7', message: '7/No match' }
+const getErrorCode = (e) => {
+  const raw = e?.error?.code ?? e?.error?.message ?? '';
+  const m = String(raw).match(/\d+/);
+  return m ? Number(m[0]) : null;
+};
+
+const friendlyVoiceError = (code) => {
+  switch (code) {
+    case 6:
+    case 7:
+      return "I couldn't hear you clearly 🎧\nMove closer to the phone, speak up a little, then tap the mic again.";
+    case 9:
+      return 'Microphone permission is off.\nEnable it in Settings → Apps → Speak It Right → Permissions.';
+    case 3:
+      return 'Microphone problem.\nClose other apps that use the mic and try again.';
+    case 1: case 2: case 4: case 10: case 11:
+      return 'The speech service could not connect.\nCheck your internet connection and try again.';
+    case 12: case 13:
+      return 'English (US) speech recognition is not available.\nMake sure the Google app is updated and English (US) is downloaded in its voice settings.';
+    default:
+      return `Speech recognition stopped unexpectedly (code ${code ?? '?'}).\nTap the mic to try again.`;
+  }
 };
 
 async function requestBlePermissions() {
@@ -196,7 +222,7 @@ function ProgressSteps({ done, current, color }) {
 
 // ───────────────────────── Game screen ─────────────────────────
 function GameScreen({
-  diff, stageIndex, sentence, result, listening,
+  diff, stageIndex, sentence, result, listening, heard, volume,
   onMic, onHear, onSwap, onNext, onBack,
 }) {
   const pop = useRef(new Animated.Value(0)).current;
@@ -276,19 +302,36 @@ function GameScreen({
         )}
       </View>
 
-      <Animated.View style={{ transform: [{ scale: pulse }], marginVertical: 18 }}>
-        <TouchableOpacity
-          style={[styles.micButton, { backgroundColor: listening ? C.bad : diff.color }]}
-          onPress={onMic}
-          disabled={isCorrect}
-          activeOpacity={0.85}
-        >
-          <Text style={styles.micIcon}>{listening ? '⏹' : '🎙️'}</Text>
-        </TouchableOpacity>
-      </Animated.View>
+      <View style={styles.micWrap}>
+        {/* Ring grows with your voice volume */}
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.micRing,
+            {
+              backgroundColor: diff.color,
+              opacity: listening ? 0.28 : 0,
+              transform: [{ scale: volume.interpolate({ inputRange: [0, 10], outputRange: [1, 1.9], extrapolate: 'clamp' }) }],
+            },
+          ]}
+        />
+        <Animated.View style={{ transform: [{ scale: pulse }] }}>
+          <TouchableOpacity
+            style={[styles.micButton, { backgroundColor: listening ? C.bad : diff.color }]}
+            onPress={onMic}
+            disabled={isCorrect}
+            activeOpacity={0.85}
+          >
+            <Text style={styles.micIcon}>{listening ? '⏹' : '🎙️'}</Text>
+          </TouchableOpacity>
+        </Animated.View>
+      </View>
       <Text style={styles.micHint}>
-        {listening ? 'Listening… tap to stop' : isCorrect ? 'Nice!' : 'Tap the mic and read the sentence'}
+        {listening ? 'Listening… speak now (tap to stop)' : isCorrect ? 'Nice!' : 'Tap the mic and read the sentence'}
       </Text>
+      {listening && (
+        <Text style={styles.heardText}>{heard ? `“${heard}”` : 'Waiting for your voice…'}</Text>
+      )}
 
       <View style={[styles.resultBox, { borderColor: resultColor }]}>
         <Text style={[styles.resultText, { color: resultColor }]}>{result.text}</Text>
@@ -369,6 +412,7 @@ export default function App() {
   const [result, setResult] = useState({ kind: 'idle', text: 'Ready when you are!', id: 0 });
   const [listening, setListening] = useState(false);
   const [mistakes, setMistakes] = useState(0);
+  const [heard, setHeard] = useState('');
   const [bleState, setBleState] = useState('disconnected');
   const [completed, setCompleted] = useState({});
 
@@ -380,6 +424,9 @@ export default function App() {
   const handlerRef = useRef(() => {});
   const timerRef = useRef(null);
   const resultId = useRef(0);
+  const volume = useRef(new Animated.Value(0)).current;
+  const errorHandlerRef = useRef(() => {});
+  const sessionRef = useRef({ active: false, retries: 0, done: true }); // one mic session
 
   const makeResult = (kind, text) => ({ kind, text, id: ++resultId.current });
   const diff = DIFFICULTIES.find((d) => d.key === diffKey);
@@ -457,9 +504,71 @@ export default function App() {
   };
 
   // ── Speech result handler (re-created every render so it never goes stale) ──
-  handlerRef.current = (alternatives) => {
+  const endSession = () => {
+    sessionRef.current.active = false;
     setListening(false);
-    if (screen !== 'game' || result.kind === 'correct' || !alternatives.length) return;
+    setHeard('');
+  };
+
+  const beginRecognition = async () => {
+    try {
+      await Voice.start('en-US');
+      return true;
+    } catch (e) {
+      console.warn('Voice.start failed', e);
+      return false;
+    }
+  };
+
+  // Android ends a session on "no speech"/"no match". Instead of giving up, restart the mic.
+  errorHandlerRef.current = async (e) => {
+    const code = getErrorCode(e);
+    const s = sessionRef.current;
+    console.warn('Speech error', code, e?.error);
+
+    if (!s.active) {
+      // The user pressed Stop, or the session already finished
+      setResult((r) =>
+        r.kind === 'correct' || r.kind === 'wrong' ? r : makeResult('idle', 'Stopped. Tap the mic to try again.')
+      );
+      return;
+    }
+
+    const retryable = code === 5 || code === 6 || code === 7 || code === 8;
+    if (retryable && s.retries < MAX_AUTO_RETRIES) {
+      s.retries += 1;
+      setResult(makeResult('listening', '🎙️ Listening… go ahead and speak'));
+      const needsReset = code === 5 || code === 8;
+      if (needsReset) await Voice.destroy().catch(() => {});
+      await new Promise((r) => setTimeout(r, needsReset ? 500 : 350));
+      if (!sessionRef.current.active || sessionRef.current !== s) return;
+      if (!(await beginRecognition())) {
+        s.done = true;
+        endSession();
+        setResult(makeResult('error', friendlyVoiceError(code)));
+      }
+      return;
+    }
+
+    s.done = true;
+    endSession();
+    setResult(makeResult('error', friendlyVoiceError(code)));
+  };
+
+  handlerRef.current = (alternatives) => {
+    const s = sessionRef.current;
+    if (s.done) return; // ignore duplicate/stale events
+    if (screen !== 'game' || result.kind === 'correct') {
+      s.done = true;
+      endSession();
+      return;
+    }
+    if (!alternatives.some((a) => a && a.trim())) {
+      errorHandlerRef.current({ error: { code: '7' } }); // empty result = "no match"
+      return;
+    }
+    s.done = true;
+    endSession();
 
     const target = normalize(sentenceRef.current);
     const targetCount = target.split(' ').length;
@@ -492,14 +601,14 @@ export default function App() {
 
   // ── Voice + cleanup ──
   useEffect(() => {
-    Voice.onSpeechStart = () => setListening(true);
-    Voice.onSpeechEnd = () => setListening(false);
-    Voice.onSpeechError = (e) => {
-      setListening(false);
-      setResult((r) => (r.kind === 'correct' ? r : makeResult('error', "Didn't catch that. Tap the mic and try again.")));
-      console.warn('Speech error', e?.error);
-    };
+    Voice.onSpeechError = (e) => errorHandlerRef.current(e);
     Voice.onSpeechResults = (e) => handlerRef.current(e?.value ?? []);
+    Voice.onSpeechPartialResults = (e) => {
+      if (sessionRef.current.active) setHeard(e?.value?.[0] ?? '');
+    };
+    Voice.onSpeechVolumeChanged = (e) => {
+      Animated.timing(volume, { toValue: Math.max(0, e?.value ?? 0), duration: 90, useNativeDriver: true }).start();
+    };
 
     const manager = managerRef.current;
     return () => {
@@ -514,8 +623,11 @@ export default function App() {
   // ── Game flow ──
   const stopAudio = () => {
     Speech.stop();
-    Voice.stop().catch(() => {});
+    sessionRef.current.active = false;
+    sessionRef.current.done = true;
+    Voice.cancel().catch(() => {});
     setListening(false);
+    setHeard('');
   };
 
   const startGame = (key) => {
@@ -549,8 +661,11 @@ export default function App() {
   const goHome = useCallback(() => {
     clearTimeout(timerRef.current);
     Speech.stop();
-    Voice.stop().catch(() => {});
+    sessionRef.current.active = false;
+    sessionRef.current.done = true;
+    Voice.cancel().catch(() => {});
     setListening(false);
+    setHeard('');
     setScreen('home');
     sendCommand('reset');
   }, [sendCommand]);
@@ -562,20 +677,43 @@ export default function App() {
 
   const toggleListening = async () => {
     try {
-      if (listening) {
+      // Tap while listening = stop and check what was heard so far
+      if (sessionRef.current.active) {
+        sessionRef.current.active = false;
+        setListening(false);
+        setResult(makeResult('idle', 'Checking what you said…'));
         await Voice.stop();
         return;
       }
+
       if (!(await requestMicPermission())) {
         Alert.alert('Microphone needed', 'Please allow microphone access to read aloud.');
         return;
       }
+      const available = await Voice.isAvailable().catch(() => 1);
+      if (!available) {
+        Alert.alert(
+          'Speech recognition unavailable',
+          'Install or update the "Google" app (Speech Recognition & Synthesis by Google) from the Play Store, then try again.'
+        );
+        return;
+      }
+
       Speech.stop();
-      setResult(makeResult('listening', '🎙️ Listening…'));
-      await Voice.start('en-US');
+      await Voice.cancel().catch(() => {}); // clear any stale session
+      sessionRef.current = { active: true, retries: 0, done: false };
+      setHeard('');
+      setListening(true);
+      setResult(makeResult('listening', '🎙️ Listening… speak now'));
+
+      if (!(await beginRecognition())) {
+        sessionRef.current.done = true;
+        endSession();
+        setResult(makeResult('error', 'Could not start the microphone. Please try again.'));
+      }
     } catch (e) {
       console.warn(e);
-      setListening(false);
+      endSession();
       setResult(makeResult('error', 'Speech recognition is unavailable on this device.'));
     }
   };
@@ -608,6 +746,8 @@ export default function App() {
           sentence={sentence}
           result={result}
           listening={listening}
+          heard={heard}
+          volume={volume}
           onMic={toggleListening}
           onHear={hearSentence}
           onSwap={swapSentence}
@@ -665,6 +805,9 @@ const styles = StyleSheet.create({
   helperText: { color: C.text, fontSize: 14, fontWeight: '600' },
   micButton: { width: 96, height: 96, borderRadius: 48, alignItems: 'center', justifyContent: 'center', elevation: 8 },
   micIcon: { fontSize: 40 },
+  micWrap: { width: 190, height: 190, alignItems: 'center', justifyContent: 'center', marginVertical: 2 },
+  micRing: { position: 'absolute', width: 96, height: 96, borderRadius: 48 },
+  heardText: { color: C.text, fontSize: 16, fontStyle: 'italic', textAlign: 'center', marginBottom: 12, minHeight: 22 },
   micHint: { color: C.muted, fontSize: 14, marginBottom: 14 },
   resultBox: { width: '100%', borderWidth: 1.5, borderRadius: 14, padding: 14, minHeight: 56, justifyContent: 'center', backgroundColor: C.card },
   resultText: { fontSize: 15, fontWeight: '700', textAlign: 'center' },
