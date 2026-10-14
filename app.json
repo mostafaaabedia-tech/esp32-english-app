@@ -1,22 +1,16 @@
 {
-  "name": "speak-it-right",
-  "version": "1.1.0",
-  "main": "index.js",
-  "scripts": {
-    "start": "expo start",
-    "android": "expo run:android"
+  "expo": {
+    "name": "Speak It Right",
+    "slug": "speak-it-right",
+    "version": "1.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "assetBundlePatterns": [
+      "**/*"
+    ]
   },
-  "dependencies": {
-    "expo": "~54.0.37",
-    "expo-speech": "~14.0.8",
-    "expo-status-bar": "~3.0.9",
-    "react": "19.1.0",
-    "react-native": "0.81.5",
-    "react-native-ble-plx": "^3.5.1",
-    "react-native-vosk": "2.1.7"
+  "android": {
+    "package": "com.speakitright.app"
   },
-  "devDependencies": {
-    "@babel/core": "^7.25.2"
-  },
-  "private": true
+  "main": "index.js"
 }
