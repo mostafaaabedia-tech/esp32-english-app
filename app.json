@@ -4,13 +4,32 @@
     "slug": "speak-it-right",
     "version": "1.1.0",
     "orientation": "portrait",
-    "userInterfaceStyle": "light",
-    "assetBundlePatterns": [
-      "**/*"
-    ]
-  },
-  "android": {
-    "package": "com.speakitright.app"
-  },
-  "main": "index.js"
+    "platforms": ["android"],
+    "newArchEnabled": true,
+    "plugins": [
+      [
+        "react-native-ble-plx",
+        { "isBackgroundEnabled": false, "neverForLocation": true }
+      ],
+      [
+        "react-native-vosk",
+        { "models": ["assets/model-en-us"] }
+      ],
+      "./plugins/withSplashColor"
+    ],
+    "android": {
+      "package": "com.example.speakitright",
+      "versionCode": 2,
+      "edgeToEdgeEnabled": true,
+      "permissions": [
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.VIBRATE"
+      ]
+    }
+  }
 }
