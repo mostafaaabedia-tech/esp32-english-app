@@ -1,3 +1,5 @@
+import vocab from './vocab.json';
+
 export const DIFFICULTIES = [
   { key: 'Beginner',     label: 'Beginner',     emoji: '🌱', color: '#22c55e', desc: 'Short and simple sentences' },
   { key: 'Intermediate', label: 'Intermediate', emoji: '🔥', color: '#f59e0b', desc: 'Longer sentences, trickier words' },
@@ -13,9 +15,19 @@ const raw = {
   Advanced: ["The aforementioned regulations supersede all prior legislation.", "She thoroughly thought through the theoretical thesis.", "Peter Piper picked a peck of pickled peppers.", "The charismatic entrepreneur established several successful startups.", "Isomorphic structures exhibit identical geometrical properties.", "The philosophical discourse explored existential themes.", "His belligerent demeanor alienated his prospective colleagues.", "The ethereal mist enveloped the desolate landscape.", "She eloquently articulated her nuanced perspective.", "The idiosyncratic scientist challenged conventional paradigms.", "A plethora of bureaucratic obstacles hindered progress.", "The clandestine operation was successfully executed.", "He possessed an insatiable thirst for knowledge.", "The ubiquitous nature of the internet is undeniable.", "Her ostentatious display of wealth was distasteful.", "The menacing locomotive hurtled down the track.", "They perused the ancient manuscript with great scrutiny.", "The convoluted plot confused the bewildered audience.", "A multifaceted approach is required to solve this.", "The juxtaposition of light and shadow created depth.", "He was known for his meticulous attention to detail.", "The archaic language made the text difficult to decipher.", "She demonstrated unparalleled proficiency in astrophysics.", "The ambivalent protagonist struggled with his morality.", "An unexpected anomaly disrupted the chronological sequence.", "The cacophony of the city was overwhelming.", "He extrapolated the data to reach a logical conclusion.", "The ubiquitous phenomenon continues to fascinate researchers.", "A ubiquitous, albeit ephemeral, sense of joy permeated the room.", "The rigorous curriculum prepared students for university.", "She gave a comprehensive analysis of the geopolitical situation.", "The diaphanous curtains fluttered in the gentle breeze.", "In retrospect, the strategic maneuver was a catastrophic failure."],
 };
 
+// Words the offline speech model cannot recognize (filled in automatically by the GitHub build).
+// Sentences containing them are skipped, so every sentence you get can really be heard.
+const OOV = new Set(vocab.oov || []);
+const wordsOf = (sentence) =>
+  sentence.toLowerCase().replace(/[’‘`]/g, '\'').replace(/[^a-z\' ]+/g, ' ').split(/\s+/).filter(Boolean);
+const playable = (list) => {
+  const ok = list.filter((sentence) => !wordsOf(sentence).some((w) => OOV.has(w)));
+  return ok.length >= 6 ? ok : list;
+};
+
 // Sort by length and split into 3 tiers: Level 1 = shortest, Level 3 = longest.
 const toStages = (list) => {
-  const sorted = [...list].sort(
+  const sorted = [...playable(list)].sort(
     (a, b) => a.split(' ').length - b.split(' ').length || a.length - b.length
   );
   const n = Math.ceil(sorted.length / 3);
