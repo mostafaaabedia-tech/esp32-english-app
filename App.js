@@ -5,51 +5,32 @@ import {
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as Speech from 'expo-speech';
+import * as Vosk from 'react-native-vosk';
 import { BleManager, State } from 'react-native-ble-plx';
-import Voice from '@react-native-voice/voice';
 import { DIFFICULTIES, STAGE_NAMES, stages } from './sentences';
+import { IPA } from './phonetics';
+import { evaluate, tokenizeHeard, markStuckWord, toGrammarPhrase } from './checker';
 
 // ───────────────────────── Constants ─────────────────────────
 const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
 const CHAR_UUID = 'beb5483e-36e1-4688-b7f5-ea0730544b34';
 const SCAN_TIMEOUT_MS = 10000;
-const MAX_AUTO_RETRIES = 4; // how many times to silently restart the mic after "no speech / no match"
 
 // Base64 of the single characters 'c', 'w', 'r', 'v' (ble-plx needs base64 payloads).
 const COMMANDS = { correct: 'Yw==', wrong: 'dw==', reset: 'cg==', win: 'dg==' };
 
+// Offline speech engine (Vosk). The model folder is added to the APK by the GitHub build.
+const MODEL_NAME = 'model-en-us';
+const LISTEN_TIMEOUT_MS = 12000;
+const DETAILED_MIN_ACCURACY = 0.85; // "Detailed" mode: share of words that must be right
+
 const C = {
   bg: '#0f172a', card: '#1e293b', border: '#334155', text: '#f8fafc',
-  muted: '#94a3b8', good: '#22c55e', bad: '#ef4444', blue: '#3b82f6',
+  muted: '#94a3b8', good: '#22c55e', bad: '#ef4444', blue: '#3b82f6', warn: '#f59e0b',
 };
-
-const NUMBER_WORDS = [
-  'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
-  'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen',
-  'eighteen', 'nineteen', 'twenty',
-];
 
 // ───────────────────────── Helpers ─────────────────────────
-const normalize = (text) =>
-  text
-    .toLowerCase()
-    .replace(/[’‘']/g, '')
-    .replace(/\b\d+\b/g, (n) => NUMBER_WORDS[Number(n)] ?? n)
-    .replace(/[^a-z ]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-const matchedWords = (target, spoken) => {
-  const a = target.split(' ');
-  const b = spoken.split(' ');
-  const dp = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0));
-  for (let i = 1; i <= a.length; i++) {
-    for (let j = 1; j <= b.length; j++) {
-      dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] + 1 : Math.max(dp[i - 1][j], dp[i][j - 1]);
-    }
-  }
-  return dp[a.length][b.length];
-};
+const cleanWord = (w) => w.toLowerCase().replace(/[’‘`]/g, "'").replace(/[^a-z']/g, '');
 
 const pickFrom = (list, avoid) => {
   let next = avoid;
@@ -57,31 +38,6 @@ const pickFrom = (list, avoid) => {
     next = list[Math.floor(Math.random() * list.length)];
   }
   return next === avoid ? list[0] : next;
-};
-
-// Android SpeechRecognizer error codes arrive like { code: '7', message: '7/No match' }
-const getErrorCode = (e) => {
-  const raw = e?.error?.code ?? e?.error?.message ?? '';
-  const m = String(raw).match(/\d+/);
-  return m ? Number(m[0]) : null;
-};
-
-const friendlyVoiceError = (code) => {
-  switch (code) {
-    case 6:
-    case 7:
-      return "I couldn't hear you clearly 🎧\nMove closer to the phone, speak up a little, then tap the mic again.";
-    case 9:
-      return 'Microphone permission is off.\nEnable it in Settings → Apps → Speak It Right → Permissions.';
-    case 3:
-      return 'Microphone problem.\nClose other apps that use the mic and try again.';
-    case 1: case 2: case 4: case 10: case 11:
-      return 'The speech service could not connect.\nCheck your internet connection and try again.';
-    case 12: case 13:
-      return 'English (US) speech recognition is not available.\nMake sure the Google app is updated and English (US) is downloaded in its voice settings.';
-    default:
-      return `Speech recognition stopped unexpectedly (code ${code ?? '?'}).\nTap the mic to try again.`;
-  }
 };
 
 async function requestBlePermissions() {
@@ -106,6 +62,11 @@ const BLE_LABELS = {
   scanning: 'Scanning…',
   connecting: 'Connecting…',
   connected: '✅  ESP32 connected',
+};
+
+const MODES = {
+  guided: { label: 'Guided', desc: 'Most reliable. Every word must be right, and it shows where you got stuck.' },
+  detailed: { label: 'Detailed', desc: 'Checks each word one by one (85% needed). Needs very clear speech.' },
 };
 
 // ───────────────────────── Confetti ─────────────────────────
@@ -159,7 +120,7 @@ function Confetti({ count = 26 }) {
 }
 
 // ───────────────────────── Home screen ─────────────────────────
-function HomeScreen({ bleState, onBle, onStart, completed }) {
+function HomeScreen({ bleState, onBle, engine, engineError, onRetryEngine, mode, onMode, onStart, completed }) {
   const busy = bleState === 'scanning' || bleState === 'connecting';
   return (
     <ScrollView contentContainerStyle={styles.screen}>
@@ -168,16 +129,48 @@ function HomeScreen({ bleState, onBle, onStart, completed }) {
       <Text style={styles.subtitle}>Read each sentence out loud. Pass 3 levels to win!</Text>
 
       <TouchableOpacity
-        style={[styles.blePill, bleState === 'connected' && { backgroundColor: '#14532d', borderColor: C.good }]}
+        style={[
+          styles.pill,
+          engine === 'ready' && { backgroundColor: '#14532d', borderColor: C.good },
+          engine === 'error' && { backgroundColor: '#7f1d1d', borderColor: C.bad },
+        ]}
+        onPress={engine === 'error' ? onRetryEngine : undefined}
+        activeOpacity={engine === 'error' ? 0.8 : 1}
+      >
+        {engine === 'loading' && <ActivityIndicator color="#fff" style={{ marginRight: 8 }} />}
+        <Text style={styles.pillText}>
+          {engine === 'loading' && 'Loading offline speech engine… (first start takes a bit)'}
+          {engine === 'ready' && '✅  Offline speech ready – no internet needed'}
+          {engine === 'error' && '⚠️  Speech engine failed – tap to retry'}
+        </Text>
+      </TouchableOpacity>
+      {engine === 'error' && !!engineError && <Text style={styles.engineError}>{engineError}</Text>}
+
+      <TouchableOpacity
+        style={[styles.pill, { marginTop: 10 }, bleState === 'connected' && { backgroundColor: '#14532d', borderColor: C.good }]}
         onPress={onBle}
         disabled={busy}
         activeOpacity={0.8}
       >
         {busy && <ActivityIndicator color="#fff" style={{ marginRight: 8 }} />}
-        <Text style={styles.blePillText}>{BLE_LABELS[bleState]}</Text>
+        <Text style={styles.pillText}>{BLE_LABELS[bleState]}</Text>
       </TouchableOpacity>
 
-      <Text style={styles.sectionLabel}>CHOOSE YOUR DIFFICULTY</Text>
+      <Text style={[styles.sectionLabel, { marginTop: 26 }]}>CHECKER</Text>
+      <View style={styles.modeRow}>
+        {Object.keys(MODES).map((k) => (
+          <TouchableOpacity
+            key={k}
+            style={[styles.modeBtn, mode === k && styles.modeBtnActive]}
+            onPress={() => onMode(k)}
+          >
+            <Text style={[styles.modeText, mode === k && { color: '#fff' }]}>{MODES[k].label}</Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+      <Text style={styles.modeDesc}>{MODES[mode].desc}</Text>
+
+      <Text style={[styles.sectionLabel, { marginTop: 22 }]}>CHOOSE YOUR DIFFICULTY</Text>
       {DIFFICULTIES.map((d) => (
         <TouchableOpacity
           key={d.key}
@@ -220,10 +213,33 @@ function ProgressSteps({ done, current, color }) {
   );
 }
 
+// ───────────────────────── Sentence with phonetics ─────────────────────────
+function WordsView({ sentence, wordStatus, showPhonetics, onWordPress }) {
+  const words = sentence.split(/\s+/).filter(Boolean);
+  return (
+    <View style={styles.wordsWrap}>
+      {words.map((w, i) => {
+        const ipa = IPA[cleanWord(w)];
+        const st = wordStatus ? wordStatus[i] : null;
+        const color = st === 'ok' ? C.good : st === 'wrong' ? C.bad : st === 'missing' ? C.warn : C.text;
+        return (
+          <TouchableOpacity key={i} style={styles.wordChip} onPress={() => onWordPress(cleanWord(w))} activeOpacity={0.6}>
+            <Text style={[styles.wordText, { color }]}>{w}</Text>
+            {showPhonetics && !!ipa && (
+              <Text style={[styles.ipaText, st ? { color } : null]}>/{ipa}/</Text>
+            )}
+          </TouchableOpacity>
+        );
+      })}
+    </View>
+  );
+}
+
 // ───────────────────────── Game screen ─────────────────────────
 function GameScreen({
-  diff, stageIndex, sentence, result, listening, heard, volume,
-  onMic, onHear, onSwap, onNext, onBack,
+  diff, stageIndex, sentence, wordStatus, result, listening, heard, engineReady,
+  showPhonetics, onTogglePhonetics,
+  onMic, onHear, onHearWord, onSwap, onNext, onBack,
 }) {
   const pop = useRef(new Animated.Value(0)).current;
   const shake = useRef(new Animated.Value(0)).current;
@@ -231,13 +247,11 @@ function GameScreen({
   const isCorrect = result.kind === 'correct';
   const lastStage = stageIndex === 2;
 
-  // Card pops in whenever the sentence changes
   useEffect(() => {
     pop.setValue(0);
     Animated.spring(pop, { toValue: 1, friction: 6, useNativeDriver: true }).start();
   }, [sentence, pop]);
 
-  // Card shakes on a wrong answer
   useEffect(() => {
     if (result.kind !== 'wrong') return;
     shake.setValue(0);
@@ -250,7 +264,6 @@ function GameScreen({
     ]).start();
   }, [result.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Mic pulses while listening
   useEffect(() => {
     if (!listening) return;
     const loop = Animated.loop(
@@ -288,46 +301,51 @@ function GameScreen({
           { opacity: pop, transform: [{ scale: pop.interpolate({ inputRange: [0, 1], outputRange: [0.85, 1] }) }, { translateX: shake }] },
         ]}
       >
-        <Text style={styles.sentenceText}>{sentence}</Text>
+        <WordsView
+          sentence={sentence}
+          wordStatus={wordStatus}
+          showPhonetics={showPhonetics}
+          onWordPress={onHearWord}
+        />
       </Animated.View>
+      <Text style={styles.tapHint}>Tap any word to hear it</Text>
 
       <View style={styles.helperRow}>
         <TouchableOpacity style={styles.helperBtn} onPress={onHear} disabled={listening}>
           <Text style={styles.helperText}>🔊 Hear it</Text>
         </TouchableOpacity>
+        <TouchableOpacity style={styles.helperBtn} onPress={onTogglePhonetics}>
+          <Text style={styles.helperText}>{showPhonetics ? '🔤 Phonetics: ON' : '🔤 Phonetics: OFF'}</Text>
+        </TouchableOpacity>
         {!isCorrect && (
           <TouchableOpacity style={styles.helperBtn} onPress={onSwap} disabled={listening}>
-            <Text style={styles.helperText}>🔀 Another one</Text>
+            <Text style={styles.helperText}>🔀 Another</Text>
           </TouchableOpacity>
         )}
       </View>
 
-      <View style={styles.micWrap}>
-        {/* Ring grows with your voice volume */}
-        <Animated.View
-          pointerEvents="none"
+      <Animated.View style={{ transform: [{ scale: pulse }], marginVertical: 18 }}>
+        <TouchableOpacity
           style={[
-            styles.micRing,
-            {
-              backgroundColor: diff.color,
-              opacity: listening ? 0.28 : 0,
-              transform: [{ scale: volume.interpolate({ inputRange: [0, 10], outputRange: [1, 1.9], extrapolate: 'clamp' }) }],
-            },
+            styles.micButton,
+            { backgroundColor: listening ? C.bad : diff.color },
+            !engineReady && { opacity: 0.4 },
           ]}
-        />
-        <Animated.View style={{ transform: [{ scale: pulse }] }}>
-          <TouchableOpacity
-            style={[styles.micButton, { backgroundColor: listening ? C.bad : diff.color }]}
-            onPress={onMic}
-            disabled={isCorrect}
-            activeOpacity={0.85}
-          >
-            <Text style={styles.micIcon}>{listening ? '⏹' : '🎙️'}</Text>
-          </TouchableOpacity>
-        </Animated.View>
-      </View>
+          onPress={onMic}
+          disabled={isCorrect || !engineReady}
+          activeOpacity={0.85}
+        >
+          <Text style={styles.micIcon}>{listening ? '⏹' : '🎙️'}</Text>
+        </TouchableOpacity>
+      </Animated.View>
       <Text style={styles.micHint}>
-        {listening ? 'Listening… speak now (tap to stop)' : isCorrect ? 'Nice!' : 'Tap the mic and read the sentence'}
+        {!engineReady
+          ? 'Speech engine is loading…'
+          : listening
+          ? 'Listening… read the sentence (tap to stop)'
+          : isCorrect
+          ? 'Nice!'
+          : 'Tap the mic and read the sentence'}
       </Text>
       {listening && (
         <Text style={styles.heardText}>{heard ? `“${heard}”` : 'Waiting for your voice…'}</Text>
@@ -409,24 +427,27 @@ export default function App() {
   const [diffKey, setDiffKey] = useState('Beginner');
   const [stageIndex, setStageIndex] = useState(0);
   const [sentence, setSentence] = useState('');
+  const [wordStatus, setWordStatus] = useState(null); // per-word 'ok' | 'wrong' | 'missing'
   const [result, setResult] = useState({ kind: 'idle', text: 'Ready when you are!', id: 0 });
   const [listening, setListening] = useState(false);
-  const [mistakes, setMistakes] = useState(0);
   const [heard, setHeard] = useState('');
+  const [mistakes, setMistakes] = useState(0);
   const [bleState, setBleState] = useState('disconnected');
   const [completed, setCompleted] = useState({});
+  const [engine, setEngine] = useState('loading'); // 'loading' | 'ready' | 'error'
+  const [engineError, setEngineError] = useState('');
+  const [mode, setMode] = useState('guided'); // 'guided' | 'detailed'
+  const [showPhonetics, setShowPhonetics] = useState(true);
 
   const managerRef = useRef(null);
   if (!managerRef.current) managerRef.current = new BleManager();
   const deviceRef = useRef(null);
   const sentenceRef = useRef('');
   sentenceRef.current = sentence;
-  const handlerRef = useRef(() => {});
+  const handlersRef = useRef({});
   const timerRef = useRef(null);
   const resultId = useRef(0);
-  const volume = useRef(new Animated.Value(0)).current;
-  const errorHandlerRef = useRef(() => {});
-  const sessionRef = useRef({ active: false, retries: 0, done: true }); // one mic session
+  const sessionRef = useRef({ active: false, done: true });
 
   const makeResult = (kind, text) => ({ kind, text, id: ++resultId.current });
   const diff = DIFFICULTIES.find((d) => d.key === diffKey);
@@ -503,129 +524,227 @@ export default function App() {
     });
   };
 
-  // ── Speech result handler (re-created every render so it never goes stale) ──
-  const endSession = () => {
-    sessionRef.current.active = false;
-    setListening(false);
-    setHeard('');
-  };
+  // ── Offline speech engine ──
+  const loadEngine = useCallback(() => {
+    setEngine('loading');
+    setEngineError('');
+    Vosk.loadModel(MODEL_NAME)
+      .then(() => setEngine('ready'))
+      .catch((e) => {
+        setEngine('error');
+        setEngineError(String(e?.message ?? e));
+      });
+  }, []);
 
-  const beginRecognition = async () => {
-    try {
-      await Voice.start('en-US');
-      return true;
-    } catch (e) {
-      console.warn('Voice.start failed', e);
-      return false;
-    }
-  };
-
-  // Android ends a session on "no speech"/"no match". Instead of giving up, restart the mic.
-  errorHandlerRef.current = async (e) => {
-    const code = getErrorCode(e);
-    const s = sessionRef.current;
-    console.warn('Speech error', code, e?.error);
-
-    if (!s.active) {
-      // The user pressed Stop, or the session already finished
-      setResult((r) =>
-        r.kind === 'correct' || r.kind === 'wrong' ? r : makeResult('idle', 'Stopped. Tap the mic to try again.')
-      );
-      return;
-    }
-
-    const retryable = code === 5 || code === 6 || code === 7 || code === 8;
-    if (retryable && s.retries < MAX_AUTO_RETRIES) {
-      s.retries += 1;
-      setResult(makeResult('listening', '🎙️ Listening… go ahead and speak'));
-      const needsReset = code === 5 || code === 8;
-      if (needsReset) await Voice.destroy().catch(() => {});
-      await new Promise((r) => setTimeout(r, needsReset ? 500 : 350));
-      if (!sessionRef.current.active || sessionRef.current !== s) return;
-      if (!(await beginRecognition())) {
-        s.done = true;
-        endSession();
-        setResult(makeResult('error', friendlyVoiceError(code)));
-      }
-      return;
-    }
-
-    s.done = true;
-    endSession();
-    setResult(makeResult('error', friendlyVoiceError(code)));
-  };
-
-  handlerRef.current = (alternatives) => {
-    const s = sessionRef.current;
-    if (s.done) return; // ignore duplicate/stale events
-    if (screen !== 'game' || result.kind === 'correct') {
-      s.done = true;
-      endSession();
-      return;
-    }
-    if (!alternatives.some((a) => a && a.trim())) {
-      errorHandlerRef.current({ error: { code: '7' } }); // empty result = "no match"
-      return;
-    }
-    s.done = true;
-    endSession();
-
-    const target = normalize(sentenceRef.current);
-    const targetCount = target.split(' ').length;
-    let best = { spoken: '', score: -1 };
-    for (const alt of alternatives) {
-      const spoken = normalize(alt);
-      const score = matchedWords(target, spoken);
-      if (score > best.score || (score === best.score && spoken === target)) best = { spoken, score };
-    }
-
-    if (best.spoken === target) {
-      setResult(makeResult('correct', stageIndex === 2 ? '🎉 PERFECT! Final level cleared!' : '✅ Correct! Well done.'));
-      Vibration.vibrate(80);
-      sendCommand('correct');
-      if (stageIndex === 2) {
-        timerRef.current = setTimeout(() => {
-          setCompleted((prev) => ({ ...prev, [diffKey]: true }));
-          setScreen('win');
-          sendCommand('win');
-        }, 1400);
-      }
-    } else {
-      const pct = Math.round((best.score / targetCount) * 100);
-      setMistakes((m) => m + 1);
-      setResult(makeResult('wrong', `❌ Not quite (${pct}% of the words)\nYou said: "${best.spoken}"`));
-      Vibration.vibrate([0, 60, 60, 60]);
-      sendCommand('wrong');
-    }
-  };
-
-  // ── Voice + cleanup ──
   useEffect(() => {
-    Voice.onSpeechError = (e) => errorHandlerRef.current(e);
-    Voice.onSpeechResults = (e) => handlerRef.current(e?.value ?? []);
-    Voice.onSpeechPartialResults = (e) => {
-      if (sessionRef.current.active) setHeard(e?.value?.[0] ?? '');
-    };
-    Voice.onSpeechVolumeChanged = (e) => {
-      Animated.timing(volume, { toValue: Math.max(0, e?.value ?? 0), duration: 90, useNativeDriver: true }).start();
-    };
-
+    loadEngine();
+    const subs = [
+      Vosk.onPartialResult((t) => handlersRef.current.partial?.(t)),
+      Vosk.onResult((t) => handlersRef.current.result?.(t)),
+      Vosk.onFinalResult((t) => handlersRef.current.final?.(t)),
+      Vosk.onError((e) => handlersRef.current.error?.(e)),
+      Vosk.onTimeout(() => handlersRef.current.timeout?.()),
+    ];
     const manager = managerRef.current;
     return () => {
+      subs.forEach((s) => s?.remove?.());
       clearTimeout(timerRef.current);
+      clearTimeout(sessionRef.current.silenceTimer);
+      clearTimeout(sessionRef.current.stopTimer);
       Speech.stop();
-      Voice.destroy().then(Voice.removeAllListeners).catch(() => {});
+      try { Vosk.unload(); } catch {}
       deviceRef.current?.cancelConnection().catch(() => {});
       manager.destroy();
     };
-  }, []);
+  }, [loadEngine]);
+
+  // ── What happens when a reading is judged correct ──
+  const onSuccess = (note) => {
+    setResult(makeResult('correct', stageIndex === 2 ? '🎉 PERFECT! Final level cleared!' : `✅ Correct! Well done.${note || ''}`));
+    Vibration.vibrate(80);
+    sendCommand('correct');
+    if (stageIndex === 2) {
+      timerRef.current = setTimeout(() => {
+        setCompleted((prev) => ({ ...prev, [diffKey]: true }));
+        setScreen('win');
+        sendCommand('win');
+      }, 1400);
+    }
+  };
+
+  // ── Judge what the recognizer heard (re-created each render so it never goes stale) ──
+  const judge = (s) => {
+    const target = sentenceRef.current;
+    const guided = s.mode === 'guided';
+    const heardText = s.segments.join(' ').trim();
+    const heardTokens = tokenizeHeard(heardText);
+    const partialTokens = tokenizeHeard(s.bestPartial);
+
+    if (!heardTokens.length && !partialTokens.length) {
+      setWordStatus(null);
+      setResult(makeResult('error', "🤔 I didn't hear a clear sentence.\nMove closer to the phone and try again."));
+      return;
+    }
+
+    const res = evaluate(target, heardText, { minAccuracy: guided ? 1 : DETAILED_MIN_ACCURACY });
+    if (res.passed) {
+      setWordStatus(res.wordStatus);
+      onSuccess(res.wrongWords.length ? `\n(Close enough: ${res.wrongWords.join(', ')})` : '');
+      return;
+    }
+
+    // Not correct → show exactly which words went wrong
+    const words = target.split(/\s+/).filter(Boolean);
+    setMistakes((m) => m + 1);
+    Vibration.vibrate([0, 60, 60, 60]);
+    sendCommand('wrong');
+
+    if (guided) {
+      // The guided recognizer only follows the target sentence, so the words it got to
+      // show how far the person came; the next word is where they got stuck.
+      const basis = heardTokens.length ? heardText : s.bestPartial;
+      const statuses = markStuckWord(evaluate(target, basis).wordStatus);
+      setWordStatus(statuses);
+      const idx = statuses.findIndex((x) => x !== 'ok');
+      setResult(
+        makeResult(
+          'wrong',
+          idx >= 0
+            ? `❌ Not quite – I lost you at “${words[idx].replace(/[.,!?]/g, '')}”.\nTap the word to hear it, then try again.`
+            : '❌ Not quite. Listen again and try once more.'
+        )
+      );
+    } else {
+      setWordStatus(res.wordStatus);
+      const total = res.wordStatus.length;
+      const okCount = res.wordStatus.filter((x) => x === 'ok').length;
+      let text = `❌ ${okCount} of ${total} words correct (${Math.round(res.accuracy * 100)}%)`;
+      if (res.wrongWords.length) text += `\nCheck: ${res.wrongWords.join(', ').replace(/[.,!?]/g, '')}`;
+      if (res.extraWords.length) text += `\nExtra words: ${res.extraWords.join(' ')}`;
+      text += `\nI heard: “${res.heardTokens.join(' ')}”`;
+      setResult(makeResult('wrong', text));
+    }
+  };
+
+  const finishSession = () => {
+    const s = sessionRef.current;
+    if (s.done) return;
+    s.done = true;
+    s.active = false;
+    clearTimeout(s.silenceTimer);
+    clearTimeout(s.stopTimer);
+    try { Vosk.stop(); } catch {}
+    setListening(false);
+    setHeard('');
+    judge(s);
+  };
+
+  const failSession = (message) => {
+    const s = sessionRef.current;
+    s.done = true;
+    s.active = false;
+    clearTimeout(s.silenceTimer);
+    clearTimeout(s.stopTimer);
+    try { Vosk.stop(); } catch {}
+    setListening(false);
+    setHeard('');
+    setResult(makeResult('error', message));
+  };
+
+  handlersRef.current = {
+    partial: (text) => {
+      const s = sessionRef.current;
+      if (!s.active) return;
+      setHeard(text);
+      if (tokenizeHeard(text).length >= tokenizeHeard(s.bestPartial).length) s.bestPartial = text;
+      clearTimeout(s.silenceTimer); // still talking
+    },
+    result: (text) => {
+      const s = sessionRef.current;
+      if (!s.active) return;
+      if (s.mode === 'guided') {
+        // Ignore a lone noise blip right after pressing the mic
+        const nothingYet = !tokenizeHeard(text).length && !s.bestPartial;
+        if (nothingYet && Date.now() - s.startedAt < 1500) return;
+        s.segments.push(text);
+        finishSession();
+        return;
+      }
+      // Detailed: collect pieces until the sentence is complete or the person goes quiet
+      s.segments.push(text);
+      clearTimeout(s.silenceTimer);
+      const total = tokenizeHeard(s.segments.join(' ')).length;
+      s.silenceTimer = setTimeout(finishSession, total >= s.targetCount ? 300 : 2200);
+    },
+    final: (text) => {
+      const s = sessionRef.current;
+      if (s.done || !s.stopping) return;
+      if (text) s.segments.push(text);
+      finishSession();
+    },
+    timeout: () => finishSession(),
+    error: (e) => {
+      console.warn('Vosk error', e);
+      if (sessionRef.current.done) return;
+      failSession('Speech engine error. Please try again.');
+    },
+  };
+
+  // ── Microphone button ──
+  const toggleListening = async () => {
+    const s = sessionRef.current;
+
+    // Tap while listening = stop and check what was heard
+    if (s.active) {
+      s.stopping = true;
+      setResult(makeResult('idle', 'Checking what you said…'));
+      try { Vosk.stop(); } catch {}
+      s.stopTimer = setTimeout(finishSession, 700); // wait briefly for the final result
+      return;
+    }
+
+    if (engine !== 'ready') {
+      setResult(makeResult('error', 'The speech engine is not ready yet.'));
+      return;
+    }
+    if (!(await requestMicPermission())) {
+      Alert.alert('Microphone needed', 'Please allow microphone access to read aloud.');
+      return;
+    }
+
+    Speech.stop();
+    const target = sentenceRef.current;
+    sessionRef.current = {
+      active: true, done: false, stopping: false, mode,
+      segments: [], bestPartial: '', startedAt: Date.now(),
+      targetCount: target.split(/\s+/).filter(Boolean).length,
+      silenceTimer: null, stopTimer: null,
+    };
+    setWordStatus(null);
+    setHeard('');
+    setListening(true);
+    setResult(makeResult('listening', '🎙️ Listening… read the sentence'));
+
+    try {
+      const options = { timeout: LISTEN_TIMEOUT_MS };
+      // Guided: the recognizer only listens for THIS sentence (much more accurate)
+      if (mode === 'guided') options.grammar = [toGrammarPhrase(target), '[unk]'];
+      await Vosk.start(options);
+    } catch (e) {
+      console.warn('Vosk.start failed', e);
+      failSession('Could not start the microphone. Please try again.');
+    }
+  };
 
   // ── Game flow ──
   const stopAudio = () => {
     Speech.stop();
-    sessionRef.current.active = false;
-    sessionRef.current.done = true;
-    Voice.cancel().catch(() => {});
+    const s = sessionRef.current;
+    s.active = false;
+    s.done = true;
+    clearTimeout(s.silenceTimer);
+    clearTimeout(s.stopTimer);
+    try { Vosk.stop(); } catch {}
     setListening(false);
     setHeard('');
   };
@@ -636,6 +755,7 @@ export default function App() {
     setDiffKey(key);
     setStageIndex(0);
     setMistakes(0);
+    setWordStatus(null);
     setSentence(pickFrom(stages[key][0], ''));
     setResult(makeResult('idle', 'Ready when you are!'));
     setScreen('game');
@@ -646,6 +766,7 @@ export default function App() {
     const idx = stageIndex + 1;
     stopAudio();
     setStageIndex(idx);
+    setWordStatus(null);
     setSentence(pickFrom(stages[diffKey][idx], ''));
     setResult(makeResult('idle', 'Ready when you are!'));
     sendCommand('reset');
@@ -653,6 +774,7 @@ export default function App() {
 
   const swapSentence = () => {
     stopAudio();
+    setWordStatus(null);
     setSentence((s) => pickFrom(stages[diffKey][stageIndex], s));
     setResult(makeResult('idle', 'New sentence – you got this!'));
     sendCommand('reset');
@@ -661,9 +783,12 @@ export default function App() {
   const goHome = useCallback(() => {
     clearTimeout(timerRef.current);
     Speech.stop();
-    sessionRef.current.active = false;
-    sessionRef.current.done = true;
-    Voice.cancel().catch(() => {});
+    const s = sessionRef.current;
+    s.active = false;
+    s.done = true;
+    clearTimeout(s.silenceTimer);
+    clearTimeout(s.stopTimer);
+    try { Vosk.stop(); } catch {}
     setListening(false);
     setHeard('');
     setScreen('home');
@@ -675,47 +800,10 @@ export default function App() {
     Speech.speak(sentence, { language: 'en-US', rate: 0.85 });
   };
 
-  const toggleListening = async () => {
-    try {
-      // Tap while listening = stop and check what was heard so far
-      if (sessionRef.current.active) {
-        sessionRef.current.active = false;
-        setListening(false);
-        setResult(makeResult('idle', 'Checking what you said…'));
-        await Voice.stop();
-        return;
-      }
-
-      if (!(await requestMicPermission())) {
-        Alert.alert('Microphone needed', 'Please allow microphone access to read aloud.');
-        return;
-      }
-      const available = await Voice.isAvailable().catch(() => 1);
-      if (!available) {
-        Alert.alert(
-          'Speech recognition unavailable',
-          'Install or update the "Google" app (Speech Recognition & Synthesis by Google) from the Play Store, then try again.'
-        );
-        return;
-      }
-
-      Speech.stop();
-      await Voice.cancel().catch(() => {}); // clear any stale session
-      sessionRef.current = { active: true, retries: 0, done: false };
-      setHeard('');
-      setListening(true);
-      setResult(makeResult('listening', '🎙️ Listening… speak now'));
-
-      if (!(await beginRecognition())) {
-        sessionRef.current.done = true;
-        endSession();
-        setResult(makeResult('error', 'Could not start the microphone. Please try again.'));
-      }
-    } catch (e) {
-      console.warn(e);
-      endSession();
-      setResult(makeResult('error', 'Speech recognition is unavailable on this device.'));
-    }
+  const hearWord = (word) => {
+    if (!word) return;
+    Speech.stop();
+    Speech.speak(word, { language: 'en-US', rate: 0.75 });
   };
 
   // Android back button goes to the menu instead of closing the app
@@ -737,19 +825,33 @@ export default function App() {
     <View style={styles.root}>
       <StatusBar style="light" />
       {screen === 'home' && (
-        <HomeScreen bleState={bleState} onBle={connectBluetooth} onStart={startGame} completed={completed} />
+        <HomeScreen
+          bleState={bleState}
+          onBle={connectBluetooth}
+          engine={engine}
+          engineError={engineError}
+          onRetryEngine={loadEngine}
+          mode={mode}
+          onMode={setMode}
+          onStart={startGame}
+          completed={completed}
+        />
       )}
       {screen === 'game' && (
         <GameScreen
           diff={diff}
           stageIndex={stageIndex}
           sentence={sentence}
+          wordStatus={wordStatus}
           result={result}
           listening={listening}
           heard={heard}
-          volume={volume}
+          engineReady={engine === 'ready'}
+          showPhonetics={showPhonetics}
+          onTogglePhonetics={() => setShowPhonetics((v) => !v)}
           onMic={toggleListening}
           onHear={hearSentence}
+          onHearWord={hearWord}
           onSwap={swapSentence}
           onNext={nextStage}
           onBack={goHome}
@@ -772,15 +874,21 @@ export default function App() {
 // ───────────────────────── Styles ─────────────────────────
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: C.bg },
-  screen: { padding: 20, paddingTop: 56, alignItems: 'center' },
+  screen: { padding: 20, paddingTop: 56, paddingBottom: 56, alignItems: 'center' },
 
   // Home
   logo: { fontSize: 56 },
   title: { fontSize: 32, fontWeight: '800', color: C.text, marginTop: 4 },
   subtitle: { fontSize: 15, color: C.muted, textAlign: 'center', marginTop: 6, marginBottom: 20 },
-  blePill: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: C.card, borderWidth: 1, borderColor: C.border, borderRadius: 30, paddingVertical: 12, paddingHorizontal: 22, marginBottom: 28 },
-  blePillText: { color: C.text, fontSize: 15, fontWeight: '600' },
+  pill: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: C.card, borderWidth: 1, borderColor: C.border, borderRadius: 30, paddingVertical: 12, paddingHorizontal: 22, width: '100%' },
+  pillText: { color: C.text, fontSize: 14, fontWeight: '600', textAlign: 'center', flexShrink: 1 },
+  engineError: { color: C.bad, fontSize: 12, textAlign: 'center', marginTop: 6 },
   sectionLabel: { alignSelf: 'flex-start', color: C.muted, fontSize: 12, fontWeight: '700', letterSpacing: 1, marginBottom: 10 },
+  modeRow: { flexDirection: 'row', width: '100%' },
+  modeBtn: { flex: 1, marginHorizontal: 4, paddingVertical: 10, borderRadius: 10, backgroundColor: C.card, borderWidth: 1, borderColor: C.border, alignItems: 'center' },
+  modeBtnActive: { backgroundColor: C.blue, borderColor: C.blue },
+  modeText: { color: C.muted, fontWeight: '700', fontSize: 14 },
+  modeDesc: { color: C.muted, fontSize: 12, textAlign: 'center', marginTop: 8 },
   diffCard: { flexDirection: 'row', alignItems: 'center', width: '100%', backgroundColor: C.card, borderRadius: 16, borderLeftWidth: 6, padding: 18, marginBottom: 14, elevation: 3 },
   diffEmoji: { fontSize: 34, marginRight: 14 },
   diffName: { color: C.text, fontSize: 20, fontWeight: '700' },
@@ -798,17 +906,19 @@ const styles = StyleSheet.create({
   stepText: { color: C.text, fontWeight: '800' },
   stepLine: { width: 44, height: 3, backgroundColor: C.border, marginHorizontal: 4, borderRadius: 2 },
   levelLabel: { color: C.muted, fontSize: 12, fontWeight: '700', letterSpacing: 1, marginBottom: 18 },
-  sentenceCard: { backgroundColor: C.card, borderWidth: 2, borderRadius: 20, padding: 28, width: '100%', minHeight: 140, alignItems: 'center', justifyContent: 'center', elevation: 4 },
-  sentenceText: { color: C.text, fontSize: 24, fontWeight: '600', textAlign: 'center', lineHeight: 34 },
-  helperRow: { flexDirection: 'row', marginTop: 14 },
-  helperBtn: { backgroundColor: C.card, borderWidth: 1, borderColor: C.border, borderRadius: 20, paddingVertical: 8, paddingHorizontal: 16, marginHorizontal: 6 },
-  helperText: { color: C.text, fontSize: 14, fontWeight: '600' },
+  sentenceCard: { backgroundColor: C.card, borderWidth: 2, borderRadius: 20, paddingVertical: 20, paddingHorizontal: 12, width: '100%', minHeight: 140, alignItems: 'center', justifyContent: 'center', elevation: 4 },
+  wordsWrap: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center' },
+  wordChip: { alignItems: 'center', paddingHorizontal: 6, paddingVertical: 6, marginHorizontal: 2 },
+  wordText: { fontSize: 22, fontWeight: '700' },
+  ipaText: { color: C.muted, fontSize: 13, marginTop: 2 },
+  tapHint: { color: C.muted, fontSize: 12, marginTop: 8 },
+  helperRow: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', marginTop: 12 },
+  helperBtn: { backgroundColor: C.card, borderWidth: 1, borderColor: C.border, borderRadius: 20, paddingVertical: 8, paddingHorizontal: 14, marginHorizontal: 4, marginBottom: 6 },
+  helperText: { color: C.text, fontSize: 13, fontWeight: '600' },
   micButton: { width: 96, height: 96, borderRadius: 48, alignItems: 'center', justifyContent: 'center', elevation: 8 },
   micIcon: { fontSize: 40 },
-  micWrap: { width: 190, height: 190, alignItems: 'center', justifyContent: 'center', marginVertical: 2 },
-  micRing: { position: 'absolute', width: 96, height: 96, borderRadius: 48 },
+  micHint: { color: C.muted, fontSize: 14, marginBottom: 10, textAlign: 'center' },
   heardText: { color: C.text, fontSize: 16, fontStyle: 'italic', textAlign: 'center', marginBottom: 12, minHeight: 22 },
-  micHint: { color: C.muted, fontSize: 14, marginBottom: 14 },
   resultBox: { width: '100%', borderWidth: 1.5, borderRadius: 14, padding: 14, minHeight: 56, justifyContent: 'center', backgroundColor: C.card },
   resultText: { fontSize: 15, fontWeight: '700', textAlign: 'center' },
   nextBtn: { paddingVertical: 15, paddingHorizontal: 30, borderRadius: 30, alignItems: 'center', marginTop: 16 },
