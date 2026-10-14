@@ -1,37 +1,22 @@
 {
-  "expo": {
-    "name": "Speak It Right",
-    "slug": "speak-it-right",
-    "version": "1.0.0",
-    "orientation": "portrait",
-    "platforms": ["android"],
-    "plugins": [
-      [
-        "react-native-ble-plx",
-        { "isBackgroundEnabled": false, "neverForLocation": true }
-      ],
-      [
-        "@react-native-voice/voice",
-        {
-          "microphonePermission": "Speak It Right needs the microphone to hear you read.",
-          "speechRecognitionPermission": "Speak It Right uses speech recognition to check your reading."
-        }
-      ],
-      "./plugins/withSpeechQueries",
-      "./plugins/withSplashColor"
-    ],
-    "android": {
-      "package": "com.example.speakitright",
-      "versionCode": 1,
-      "permissions": [
-        "android.permission.BLUETOOTH",
-        "android.permission.BLUETOOTH_ADMIN",
-        "android.permission.BLUETOOTH_CONNECT",
-        "android.permission.BLUETOOTH_SCAN",
-        "android.permission.ACCESS_FINE_LOCATION",
-        "android.permission.RECORD_AUDIO",
-        "android.permission.VIBRATE"
-      ]
-    }
-  }
+  "name": "speak-it-right",
+  "version": "1.1.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android"
+  },
+  "dependencies": {
+    "expo": "~54.0.37",
+    "expo-speech": "~14.0.8",
+    "expo-status-bar": "~3.0.9",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "react-native-ble-plx": "^3.5.1",
+    "react-native-vosk": "2.1.7"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.25.2"
+  },
+  "private": true
 }
