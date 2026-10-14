@@ -54,28 +54,28 @@ jobs:
         id: model-cache
         uses: actions/cache@v4
         with:
-          path: assets/model-en-us
-          key: vosk-model-small-en-us-0.15
+          path: vosk-model/model-en-us
+          key: vosk-model-small-en-us-0.15-v2
 
       - name: Download speech model
         if: steps.model-cache.outputs.cache-hit != 'true'
         run: |
           set -e
-          mkdir -p assets
+          mkdir -p vosk-model
           curl -fL --retry 5 --retry-delay 5 -o model.zip \
             https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
           unzip -q model.zip
-          mv vosk-model-small-en-us-0.15 assets/model-en-us
+          mv vosk-model-small-en-us-0.15 vosk-model/model-en-us
           rm model.zip
 
       - name: Check speech model
         run: |
-          ls assets/model-en-us
-          test -d assets/model-en-us/am && test -d assets/model-en-us/graph \
+          ls vosk-model/model-en-us
+          test -d vosk-model/model-en-us/am && test -d vosk-model/model-en-us/graph \
             || { echo "Speech model folder looks wrong"; exit 1; }
 
       - name: Skip sentences the model cannot hear
-        run: node scripts/make-vocab.js assets/model-en-us
+        run: node scripts/make-vocab.js vosk-model/model-en-us
 
       # Bundles the JavaScript on its own so errors (missing imports, typos) are readable
       - name: Check JavaScript bundle
@@ -84,6 +84,16 @@ jobs:
       # ---- Android build ----
       - name: Generate native Android project
         run: npx expo prebuild --platform android --no-install --clean
+
+      # Put the speech model straight into the app's own assets folder (always packed into the APK)
+      - name: Add speech model to the app
+        run: |
+          set -e
+          mkdir -p android/app/src/main/assets
+          rm -rf android/app/src/main/assets/model-en-us
+          cp -r vosk-model/model-en-us android/app/src/main/assets/model-en-us
+          python3 -c "import uuid; print(uuid.uuid4())" > android/app/src/main/assets/model-en-us/uuid
+          ls android/app/src/main/assets/model-en-us
 
       - name: Give Gradle more memory
         run: echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g" >> android/gradle.properties
