@@ -14,6 +14,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Fails in seconds with a clear message if a file was not uploaded to the repo
+      - name: Check that all project files exist
+        run: |
+          missing=0
+          for f in App.js index.js checker.js phonetics.js sentences.js vocab.json \
+                   package.json app.json babel.config.js \
+                   plugins/withSplashColor.js scripts/make-vocab.js; do
+            if [ ! -f "$f" ]; then echo "MISSING FILE: $f"; missing=1; fi
+          done
+          if [ "$missing" = "1" ]; then
+            echo "Upload the missing file(s) to the TOP LEVEL of the repo (not inside a subfolder)."
+            exit 1
+          fi
+          echo "All project files are present."
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -27,6 +42,12 @@ jobs:
 
       - name: Install dependencies
         run: npm install --no-audit --no-fund --legacy-peer-deps
+
+      - name: Check native modules are installed
+        run: |
+          for m in react-native-vosk react-native-ble-plx expo-speech expo-status-bar; do
+            test -d "node_modules/$m" || { echo "MISSING PACKAGE: $m - fix package.json"; exit 1; }
+          done
 
       # ---- Offline speech model (stored in the APK, no internet needed on the phone) ----
       - name: Cache speech model
@@ -55,6 +76,10 @@ jobs:
 
       - name: Skip sentences the model cannot hear
         run: node scripts/make-vocab.js assets/model-en-us
+
+      # Bundles the JavaScript on its own so errors (missing imports, typos) are readable
+      - name: Check JavaScript bundle
+        run: npx expo export --platform android --output-dir /tmp/bundle-check
 
       # ---- Android build ----
       - name: Generate native Android project
