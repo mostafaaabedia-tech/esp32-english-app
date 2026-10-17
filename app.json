@@ -2,24 +2,33 @@
   "expo": {
     "name": "Speak It Right",
     "slug": "speak-it-right",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "orientation": "portrait",
-    "platforms": ["android"],
+    "platforms": [
+      "android"
+    ],
     "newArchEnabled": true,
     "plugins": [
       [
         "react-native-ble-plx",
-        { "isBackgroundEnabled": false, "neverForLocation": true }
+        {
+          "isBackgroundEnabled": false,
+          "neverForLocation": true
+        }
       ],
       [
         "react-native-vosk",
-        { "models": ["assets/model-en-us"] }
+        {
+          "models": [
+            "assets/model-en-us"
+          ]
+        }
       ],
       "./plugins/withSplashColor"
     ],
     "android": {
       "package": "com.example.speakitright",
-      "versionCode": 2,
+      "versionCode": 3,
       "edgeToEdgeEnabled": true,
       "permissions": [
         "android.permission.BLUETOOTH",
@@ -29,7 +38,12 @@
         "android.permission.ACCESS_FINE_LOCATION",
         "android.permission.RECORD_AUDIO",
         "android.permission.VIBRATE"
-      ]
-    }
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#FFFFFF"
+      }
+    },
+    "icon": "./assets/icon.png"
   }
 }
