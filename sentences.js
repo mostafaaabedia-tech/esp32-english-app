@@ -6,7 +6,8 @@ export const DIFFICULTIES = [
   { key: 'Advanced',     label: 'Advanced',     emoji: '🚀', color: '#a855f7', desc: 'Big vocabulary and tongue twisters' },
 ];
 
-export const STAGE_NAMES = ['Warm-up', 'Challenge', 'Final Boss'];
+export const STAGE_NAMES = ['Warm-up', 'Getting Better', 'Challenge', 'Expert', 'Final Boss'];
+export const STAGE_COUNT = STAGE_NAMES.length; // levels per difficulty (add a name above to add a level)
 
 
 const raw = {
@@ -22,16 +23,19 @@ const wordsOf = (sentence) =>
   sentence.toLowerCase().replace(/[’‘`]/g, '\'').replace(/[^a-z\' ]+/g, ' ').split(/\s+/).filter(Boolean);
 const playable = (list) => {
   const ok = list.filter((sentence) => !wordsOf(sentence).some((w) => OOV.has(w)));
-  return ok.length >= 6 ? ok : list;
+  return ok.length >= 10 ? ok : list;
 };
 
-// Sort by length and split into 3 tiers: Level 1 = shortest, Level 3 = longest.
+// Sort by length and split into STAGE_COUNT tiers: Level 1 = shortest, last level = longest.
 const toStages = (list) => {
   const sorted = [...playable(list)].sort(
     (a, b) => a.split(' ').length - b.split(' ').length || a.length - b.length
   );
-  const n = Math.ceil(sorted.length / 3);
-  return [sorted.slice(0, n), sorted.slice(n, 2 * n), sorted.slice(2 * n)];
+  const n = Math.ceil(sorted.length / STAGE_COUNT);
+  return Array.from({ length: STAGE_COUNT }, (_, i) => {
+    const tier = sorted.slice(i * n, (i + 1) * n);
+    return tier.length ? tier : sorted.slice(-2);
+  });
 };
 
 export const stages = {
