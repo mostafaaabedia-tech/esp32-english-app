@@ -1,13 +1,13 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   StyleSheet, Text, View, TouchableOpacity, Alert, Animated, Easing, Vibration,
-  PermissionsAndroid, Platform, ActivityIndicator, Dimensions, ScrollView, BackHandler,
+  PermissionsAndroid, Platform, ActivityIndicator, Dimensions, ScrollView, BackHandler, Image,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as Speech from 'expo-speech';
 import * as Vosk from 'react-native-vosk';
 import { BleManager, State } from 'react-native-ble-plx';
-import { DIFFICULTIES, STAGE_NAMES, stages } from './sentences';
+import { DIFFICULTIES, STAGE_NAMES, STAGE_COUNT, stages } from './sentences';
 import { IPA } from './phonetics';
 import { evaluate, tokenizeHeard, markStuckWord, toGrammarPhrase } from './checker';
 
@@ -15,6 +15,10 @@ import { evaluate, tokenizeHeard, markStuckWord, toGrammarPhrase } from './check
 const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
 const CHAR_UUID = 'beb5483e-36e1-4688-b7f5-ea0730544b34';
 const SCAN_TIMEOUT_MS = 10000;
+const LAST_STAGE = STAGE_COUNT - 1;
+
+const LOGO = require('./assets/logo.png');
+const CREDIT = 'Made by Mostafa Mesbah Abedi and Soliman Lodin';
 
 // Base64 of the single characters 'c', 'w', 'r', 'v' (ble-plx needs base64 payloads).
 const COMMANDS = { correct: 'Yw==', wrong: 'dw==', reset: 'cg==', win: 'dg==' };
@@ -124,9 +128,10 @@ function HomeScreen({ bleState, onBle, engine, engineError, onRetryEngine, mode,
   const busy = bleState === 'scanning' || bleState === 'connecting';
   return (
     <ScrollView contentContainerStyle={styles.screen}>
-      <Text style={styles.logo}>🗣️</Text>
+      <Image source={LOGO} style={styles.logoImg} />
       <Text style={styles.title}>Speak It Right</Text>
-      <Text style={styles.subtitle}>Read each sentence out loud. Pass 3 levels to win!</Text>
+      <Text style={styles.credit}>{CREDIT}</Text>
+      <Text style={styles.subtitle}>Read each sentence out loud. Pass {STAGE_COUNT} levels to win!</Text>
 
       <TouchableOpacity
         style={[
@@ -182,7 +187,7 @@ function HomeScreen({ bleState, onBle, engine, engineError, onRetryEngine, mode,
           <View style={{ flex: 1 }}>
             <Text style={styles.diffName}>{d.label}</Text>
             <Text style={styles.diffDesc}>{d.desc}</Text>
-            <Text style={[styles.diffLevels, { color: d.color }]}>3 levels</Text>
+            <Text style={[styles.diffLevels, { color: d.color }]}>{STAGE_COUNT} levels</Text>
           </View>
           <Text style={styles.diffArrow}>{completed[d.key] ? '🏆' : '›'}</Text>
         </TouchableOpacity>
@@ -195,7 +200,7 @@ function HomeScreen({ bleState, onBle, engine, engineError, onRetryEngine, mode,
 function ProgressSteps({ done, current, color }) {
   return (
     <View style={styles.steps}>
-      {[0, 1, 2].map((i) => (
+      {Array.from({ length: STAGE_COUNT }, (_, i) => i).map((i) => (
         <React.Fragment key={i}>
           <View
             style={[
@@ -206,7 +211,7 @@ function ProgressSteps({ done, current, color }) {
           >
             <Text style={styles.stepText}>{i < done ? '✓' : i + 1}</Text>
           </View>
-          {i < 2 && <View style={[styles.stepLine, i < done && { backgroundColor: color }]} />}
+          {i < STAGE_COUNT - 1 && <View style={[styles.stepLine, i < done && { backgroundColor: color }]} />}
         </React.Fragment>
       ))}
     </View>
@@ -245,7 +250,7 @@ function GameScreen({
   const shake = useRef(new Animated.Value(0)).current;
   const pulse = useRef(new Animated.Value(1)).current;
   const isCorrect = result.kind === 'correct';
-  const lastStage = stageIndex === 2;
+  const lastStage = stageIndex === LAST_STAGE;
 
   useEffect(() => {
     pop.setValue(0);
@@ -286,12 +291,14 @@ function GameScreen({
           <Text style={styles.backText}>‹ Menu</Text>
         </TouchableOpacity>
         <Text style={[styles.topTitle, { color: diff.color }]}>{diff.emoji} {diff.label}</Text>
-        <View style={{ width: 70 }} />
+        <View style={{ width: 70, alignItems: 'flex-end' }}>
+          <Image source={LOGO} style={styles.topLogo} />
+        </View>
       </View>
 
       <ProgressSteps done={stageIndex + (isCorrect ? 1 : 0)} current={stageIndex} color={diff.color} />
       <Text style={styles.levelLabel}>
-        LEVEL {stageIndex + 1} OF 3 · {STAGE_NAMES[stageIndex].toUpperCase()}
+        LEVEL {stageIndex + 1} OF {STAGE_COUNT} · {STAGE_NAMES[stageIndex].toUpperCase()}
       </Text>
 
       <Animated.View
@@ -360,14 +367,14 @@ function GameScreen({
           <Text style={styles.nextText}>Next level ➜</Text>
         </TouchableOpacity>
       )}
-      {isCorrect && lastStage && <Text style={styles.winSoon}>🏆 All 3 levels done…</Text>}
+      {isCorrect && lastStage && <Text style={styles.winSoon}>🏆 All {STAGE_COUNT} levels done…</Text>}
     </ScrollView>
   );
 }
 
 // ───────────────────────── Win screen ─────────────────────────
 function WinScreen({ diff, mistakes, nextDiff, onAgain, onNextDiff, onHome }) {
-  const stars = mistakes === 0 ? 3 : mistakes <= 2 ? 2 : 1;
+  const stars = mistakes === 0 ? 3 : mistakes <= 3 ? 2 : 1;
   const starAnims = useRef([0, 1, 2].map(() => new Animated.Value(0))).current;
   const bounce = useRef(new Animated.Value(0)).current;
 
@@ -392,7 +399,7 @@ function WinScreen({ diff, mistakes, nextDiff, onAgain, onNextDiff, onHome }) {
       <ScrollView contentContainerStyle={[styles.screen, { justifyContent: 'center', flexGrow: 1 }]}>
         <Animated.Text style={[styles.trophy, { transform: [{ translateY: bounce }] }]}>🏆</Animated.Text>
         <Text style={[styles.winTitle, { color: diff.color }]}>YOU WIN!</Text>
-        <Text style={styles.winSub}>You finished all 3 {diff.label} levels</Text>
+        <Text style={styles.winSub}>You finished all {STAGE_COUNT} {diff.label} levels</Text>
 
         <View style={styles.starsRow}>
           {starAnims.map((a, i) => (
@@ -416,6 +423,8 @@ function WinScreen({ diff, mistakes, nextDiff, onAgain, onNextDiff, onHome }) {
         <TouchableOpacity style={[styles.nextBtn, { backgroundColor: C.card, borderWidth: 1, borderColor: C.border, width: '100%' }]} onPress={onHome}>
           <Text style={styles.nextText}>🏠 Menu</Text>
         </TouchableOpacity>
+        <Image source={LOGO} style={[styles.topLogo, { marginTop: 22 }]} />
+        <Text style={styles.credit}>{CREDIT}</Text>
       </ScrollView>
     </View>
   );
@@ -560,10 +569,10 @@ export default function App() {
 
   // ── What happens when a reading is judged correct ──
   const onSuccess = (note) => {
-    setResult(makeResult('correct', stageIndex === 2 ? '🎉 PERFECT! Final level cleared!' : `✅ Correct! Well done.${note || ''}`));
+    setResult(makeResult('correct', stageIndex === LAST_STAGE ? '🎉 PERFECT! Final level cleared!' : `✅ Correct! Well done.${note || ''}`));
     Vibration.vibrate(80);
     sendCommand('correct');
-    if (stageIndex === 2) {
+    if (stageIndex === LAST_STAGE) {
       timerRef.current = setTimeout(() => {
         setCompleted((prev) => ({ ...prev, [diffKey]: true }));
         setScreen('win');
@@ -877,7 +886,9 @@ const styles = StyleSheet.create({
   screen: { padding: 20, paddingTop: 56, paddingBottom: 56, alignItems: 'center' },
 
   // Home
-  logo: { fontSize: 56 },
+  logoImg: { width: 110, height: 110, marginBottom: 4 },
+  credit: { color: C.muted, fontSize: 12, textAlign: 'center', marginTop: 2, marginBottom: 4 },
+  topLogo: { width: 38, height: 38 },
   title: { fontSize: 32, fontWeight: '800', color: C.text, marginTop: 4 },
   subtitle: { fontSize: 15, color: C.muted, textAlign: 'center', marginTop: 6, marginBottom: 20 },
   pill: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: C.card, borderWidth: 1, borderColor: C.border, borderRadius: 30, paddingVertical: 12, paddingHorizontal: 22, width: '100%' },
@@ -902,9 +913,9 @@ const styles = StyleSheet.create({
   backText: { color: C.muted, fontSize: 16, fontWeight: '600' },
   topTitle: { fontSize: 18, fontWeight: '800' },
   steps: { flexDirection: 'row', alignItems: 'center', marginBottom: 10 },
-  stepDot: { width: 34, height: 34, borderRadius: 17, borderWidth: 2, borderColor: C.border, alignItems: 'center', justifyContent: 'center', backgroundColor: C.card },
+  stepDot: { width: 30, height: 30, borderRadius: 15, borderWidth: 2, borderColor: C.border, alignItems: 'center', justifyContent: 'center', backgroundColor: C.card },
   stepText: { color: C.text, fontWeight: '800' },
-  stepLine: { width: 44, height: 3, backgroundColor: C.border, marginHorizontal: 4, borderRadius: 2 },
+  stepLine: { width: 26, height: 3, backgroundColor: C.border, marginHorizontal: 3, borderRadius: 2 },
   levelLabel: { color: C.muted, fontSize: 12, fontWeight: '700', letterSpacing: 1, marginBottom: 18 },
   sentenceCard: { backgroundColor: C.card, borderWidth: 2, borderRadius: 20, paddingVertical: 20, paddingHorizontal: 12, width: '100%', minHeight: 140, alignItems: 'center', justifyContent: 'center', elevation: 4 },
   wordsWrap: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center' },
