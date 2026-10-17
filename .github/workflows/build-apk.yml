@@ -20,7 +20,8 @@ jobs:
           missing=0
           for f in App.js index.js checker.js phonetics.js sentences.js vocab.json \
                    package.json app.json babel.config.js \
-                   plugins/withSplashColor.js scripts/make-vocab.js; do
+                   plugins/withSplashColor.js scripts/make-vocab.js \
+                   assets/logo.png assets/icon.png assets/adaptive-icon.png; do
             if [ ! -f "$f" ]; then echo "MISSING FILE: $f"; missing=1; fi
           done
           if [ "$missing" = "1" ]; then
