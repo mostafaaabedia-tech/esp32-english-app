@@ -1,15 +1,27 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
-  StyleSheet, Text, View, TouchableOpacity, Alert, Animated, Easing, Vibration,
-  PermissionsAndroid, Platform, ActivityIndicator, Dimensions, ScrollView, BackHandler, Image,
+  StyleSheet, View, Alert, Animated, Vibration, PermissionsAndroid, Platform,
+  ActivityIndicator, ScrollView, BackHandler, Image, Pressable, StatusBar as RNStatusBar,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as Speech from 'expo-speech';
 import * as Vosk from 'react-native-vosk';
 import { BleManager, State } from 'react-native-ble-plx';
+import { useFonts } from 'expo-font';
+import { Lexend_400Regular } from '@expo-google-fonts/lexend/400Regular';
+import { Lexend_500Medium } from '@expo-google-fonts/lexend/500Medium';
+import { Lexend_600SemiBold } from '@expo-google-fonts/lexend/600SemiBold';
+import { Lexend_700Bold } from '@expo-google-fonts/lexend/700Bold';
+
 import { DIFFICULTIES, STAGE_NAMES, STAGE_COUNT, stages } from './sentences';
 import { IPA } from './phonetics';
-import { evaluate, tokenizeHeard, markStuckWord, toGrammarPhrase } from './checker';
+import { evaluate, liveProgress, heardWords, starsFor, toGrammarPhrase } from './checker';
+import { C, MARK_COLORS, setFontsReady } from './theme';
+import { T, Icon, Button, Rise, Stars, Bar, CountUp, PulseRings, Confetti } from './ui';
+import {
+  loadProgress, saveProgress, defaultProgress, recordPass, recordWords,
+  totalStars, nextStage, DAILY_GOAL, MASTER_AFTER,
+} from './storage';
 
 // ───────────────────────── Constants ─────────────────────────
 const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
@@ -17,30 +29,40 @@ const CHAR_UUID = 'beb5483e-36e1-4688-b7f5-ea0730544b34';
 const SCAN_TIMEOUT_MS = 10000;
 const LAST_STAGE = STAGE_COUNT - 1;
 
-const LOGO = require('./assets/logo.png');
-const CREDIT = 'Made by Mostafa Mesbah Abedi and Soliman Lodin';
-
 // Base64 of the single characters 'c', 'w', 'r', 'v' (ble-plx needs base64 payloads).
 const COMMANDS = { correct: 'Yw==', wrong: 'dw==', reset: 'cg==', win: 'dg==' };
 
 // Offline speech engine (Vosk). The model folder is added to the APK by the GitHub build.
 const MODEL_NAME = 'model-en-us';
-const LISTEN_TIMEOUT_MS = 12000;
-const DETAILED_MIN_ACCURACY = 0.85; // "Detailed" mode: share of words that must be right
+const MAX_LISTEN_MS = 30000;       // longest time the mic stays open for one reading
+const PAUSE_AFTER_SPEECH_MS = 2600; // silence after speaking that ends the reading (lets slow readers pause)
+const NOTHING_HEARD_MS = 9000;     // give up when no word was heard at all
 
-const C = {
-  bg: '#0f172a', card: '#1e293b', border: '#334155', text: '#f8fafc',
-  muted: '#94a3b8', good: '#22c55e', bad: '#ef4444', blue: '#3b82f6', warn: '#f59e0b',
+const LOGO = require('./assets/logo.png');
+const CREDIT = 'Made by Mostafa Mesbah Abedi and Soliman Lodin';
+
+const MODES = {
+  guided: {
+    label: 'Guided',
+    desc: 'Listens for the words of this sentence. Best for learning and for noisy rooms.',
+  },
+  open: {
+    label: 'Open',
+    desc: 'Writes down whatever you say, then compares it. Harder, and shows the exact words it heard. Works best with the Relaxed pass mark in a quiet room.',
+  },
 };
+const PASS_MARKS = [
+  { value: 0.7, label: 'Relaxed', desc: '70% of the words' },
+  { value: 0.85, label: 'Normal', desc: '85% of the words' },
+  { value: 1, label: 'Perfect', desc: 'every word' },
+];
 
 // ───────────────────────── Helpers ─────────────────────────
 const cleanWord = (w) => w.toLowerCase().replace(/[’‘`]/g, "'").replace(/[^a-z']/g, '');
 
 const pickFrom = (list, avoid) => {
   let next = avoid;
-  while (next === avoid && list.length > 1) {
-    next = list[Math.floor(Math.random() * list.length)];
-  }
+  while (next === avoid && list.length > 1) next = list[Math.floor(Math.random() * list.length)];
   return next === avoid ? list[0] : next;
 };
 
@@ -61,407 +83,630 @@ async function requestMicPermission() {
   return res === PermissionsAndroid.RESULTS.GRANTED;
 }
 
-const BLE_LABELS = {
-  disconnected: '📡  Connect to ESP32',
-  scanning: 'Scanning…',
-  connecting: 'Connecting…',
-  connected: '✅  ESP32 connected',
-};
+const TOP_PAD = (RNStatusBar.currentHeight || 24) + 14;
 
-const MODES = {
-  guided: { label: 'Guided', desc: 'Most reliable. Every word must be right, and it shows where you got stuck.' },
-  detailed: { label: 'Detailed', desc: 'Checks each word one by one (85% needed). Needs very clear speech.' },
-};
-
-// ───────────────────────── Confetti ─────────────────────────
-const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
-const CONFETTI = ['🎉', '⭐', '✨', '🎊', '🌟'];
-
-function Confetti({ count = 26 }) {
-  const pieces = useRef(
-    Array.from({ length: count }, (_, i) => ({
-      x: Math.random() * (SCREEN_W - 30),
-      delay: Math.random() * 1500,
-      duration: 2800 + Math.random() * 2200,
-      emoji: CONFETTI[i % CONFETTI.length],
-      size: 18 + Math.random() * 16,
-      anim: new Animated.Value(0),
-    }))
-  ).current;
-
+// ───────────────────────── Reading card ─────────────────────────
+// One word of the sentence. It is highlighted while it is being heard, then stamped
+// green / amber / red when the reading has been checked.
+function Word({ word, index, mark, lit, heard, showPhonetics, onPress }) {
+  const stamp = useRef(new Animated.Value(1)).current;
   useEffect(() => {
-    const loops = pieces.map((p) =>
-      Animated.loop(
-        Animated.timing(p.anim, {
-          toValue: 1, duration: p.duration, delay: p.delay,
-          easing: Easing.linear, useNativeDriver: true,
-        })
-      )
-    );
-    loops.forEach((l) => l.start());
-    return () => loops.forEach((l) => l.stop());
-  }, [pieces]);
+    if (!mark) return;
+    stamp.setValue(0.6);
+    Animated.sequence([
+      Animated.delay(index * 70),
+      Animated.spring(stamp, { toValue: 1, friction: 4, tension: 160, useNativeDriver: true }),
+    ]).start();
+  }, [mark]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const ipa = IPA[cleanWord(word)];
+  const colors = mark ? MARK_COLORS[mark] : null;
+  const bg = colors ? colors.bg : lit ? C.tealSoft : 'transparent';
+  const fg = colors ? colors.fg : C.ink;
+  const label = mark === 'missing' ? 'skipped' : heard ? `heard “${heard}”` : mark === 'wrong' ? 'not clear' : null;
 
   return (
-    <View pointerEvents="none" style={StyleSheet.absoluteFill}>
-      {pieces.map((p, i) => (
-        <Animated.Text
-          key={i}
-          style={{
-            position: 'absolute', left: p.x, top: -40, fontSize: p.size,
-            opacity: p.anim.interpolate({ inputRange: [0, 0.9, 1], outputRange: [1, 1, 0] }),
-            transform: [
-              { translateY: p.anim.interpolate({ inputRange: [0, 1], outputRange: [0, SCREEN_H + 60] }) },
-              { rotate: p.anim.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '360deg'] }) },
-            ],
-          }}
-        >
-          {p.emoji}
-        </Animated.Text>
-      ))}
-    </View>
+    <Pressable onPress={() => onPress(cleanWord(word))} accessibilityLabel={`${word}. Tap to hear it.`}>
+      <Animated.View style={[styles.word, { backgroundColor: bg, transform: [{ scale: stamp }] }]}>
+        <T w="semi" style={[styles.wordText, { color: fg }, mark === 'missing' && styles.wordSkipped]}>{word}</T>
+        {showPhonetics && !!ipa && <T style={[styles.ipa, colors && { color: fg }]}>/{ipa}/</T>}
+        {!!label && mark !== 'ok' && <T w="medium" style={[styles.wordNote, { color: fg }]}>{label}</T>}
+      </Animated.View>
+    </Pressable>
   );
 }
 
-// ───────────────────────── Home screen ─────────────────────────
-function HomeScreen({ bleState, onBle, engine, engineError, onRetryEngine, mode, onMode, onStart, completed }) {
-  const busy = bleState === 'scanning' || bleState === 'connecting';
+function ReadingCard({ sentence, marks, lit, heardFor, showPhonetics, onWordPress, tone }) {
+  const words = sentence.split(/\s+/).filter(Boolean);
+  const pop = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    pop.setValue(0);
+    Animated.spring(pop, { toValue: 1, friction: 7, useNativeDriver: true }).start();
+  }, [sentence, pop]);
+  const border = tone === 'pass' ? C.good : tone === 'fail' ? C.bad : C.line;
   return (
-    <ScrollView contentContainerStyle={styles.screen}>
-      <Image source={LOGO} style={styles.logoImg} />
-      <Text style={styles.title}>Speak It Right</Text>
-      <Text style={styles.credit}>{CREDIT}</Text>
-      <Text style={styles.subtitle}>Read each sentence out loud. Pass {STAGE_COUNT} levels to win!</Text>
-
-      <TouchableOpacity
-        style={[
-          styles.pill,
-          engine === 'ready' && { backgroundColor: '#14532d', borderColor: C.good },
-          engine === 'error' && { backgroundColor: '#7f1d1d', borderColor: C.bad },
-        ]}
-        onPress={engine === 'error' ? onRetryEngine : undefined}
-        activeOpacity={engine === 'error' ? 0.8 : 1}
-      >
-        {engine === 'loading' && <ActivityIndicator color="#fff" style={{ marginRight: 8 }} />}
-        <Text style={styles.pillText}>
-          {engine === 'loading' && 'Loading offline speech engine… (first start takes a bit)'}
-          {engine === 'ready' && '✅  Offline speech ready – no internet needed'}
-          {engine === 'error' && '⚠️  Speech engine failed – tap to retry'}
-        </Text>
-      </TouchableOpacity>
-      {engine === 'error' && !!engineError && <Text style={styles.engineError}>{engineError}</Text>}
-
-      <TouchableOpacity
-        style={[styles.pill, { marginTop: 10 }, bleState === 'connected' && { backgroundColor: '#14532d', borderColor: C.good }]}
-        onPress={onBle}
-        disabled={busy}
-        activeOpacity={0.8}
-      >
-        {busy && <ActivityIndicator color="#fff" style={{ marginRight: 8 }} />}
-        <Text style={styles.pillText}>{BLE_LABELS[bleState]}</Text>
-      </TouchableOpacity>
-
-      <Text style={[styles.sectionLabel, { marginTop: 26 }]}>CHECKER</Text>
-      <View style={styles.modeRow}>
-        {Object.keys(MODES).map((k) => (
-          <TouchableOpacity
-            key={k}
-            style={[styles.modeBtn, mode === k && styles.modeBtnActive]}
-            onPress={() => onMode(k)}
-          >
-            <Text style={[styles.modeText, mode === k && { color: '#fff' }]}>{MODES[k].label}</Text>
-          </TouchableOpacity>
+    <Animated.View
+      style={[
+        styles.readingCard,
+        { borderColor: border, opacity: pop, transform: [{ translateY: pop.interpolate({ inputRange: [0, 1], outputRange: [14, 0] }) }] },
+      ]}
+    >
+      <View style={styles.marginLine} />
+      <View style={styles.wordsWrap}>
+        {words.map((w, i) => (
+          <Word
+            key={`${sentence}-${i}`}
+            word={w}
+            index={i}
+            mark={marks ? marks[i] : null}
+            lit={lit ? lit[i] : false}
+            heard={heardFor ? heardFor[i] : null}
+            showPhonetics={showPhonetics}
+            onPress={onWordPress}
+          />
         ))}
       </View>
-      <Text style={styles.modeDesc}>{MODES[mode].desc}</Text>
-
-      <Text style={[styles.sectionLabel, { marginTop: 22 }]}>CHOOSE YOUR DIFFICULTY</Text>
-      {DIFFICULTIES.map((d) => (
-        <TouchableOpacity
-          key={d.key}
-          style={[styles.diffCard, { borderLeftColor: d.color }]}
-          onPress={() => onStart(d.key)}
-          activeOpacity={0.85}
-        >
-          <Text style={styles.diffEmoji}>{d.emoji}</Text>
-          <View style={{ flex: 1 }}>
-            <Text style={styles.diffName}>{d.label}</Text>
-            <Text style={styles.diffDesc}>{d.desc}</Text>
-            <Text style={[styles.diffLevels, { color: d.color }]}>{STAGE_COUNT} levels</Text>
-          </View>
-          <Text style={styles.diffArrow}>{completed[d.key] ? '🏆' : '›'}</Text>
-        </TouchableOpacity>
-      ))}
-    </ScrollView>
+    </Animated.View>
   );
 }
 
-// ───────────────────────── Progress steps ─────────────────────────
-function ProgressSteps({ done, current, color }) {
+// ───────────────────────── Microphone ─────────────────────────
+function MicButton({ listening, color, disabled, onPress, size = 92 }) {
+  const press = useRef(new Animated.Value(1)).current;
+  const to = (v) => Animated.spring(press, { toValue: v, friction: 5, useNativeDriver: true }).start();
   return (
-    <View style={styles.steps}>
-      {Array.from({ length: STAGE_COUNT }, (_, i) => i).map((i) => (
-        <React.Fragment key={i}>
-          <View
-            style={[
-              styles.stepDot,
-              i < done && { backgroundColor: color, borderColor: color },
-              i === current && i >= done && { borderColor: color },
-            ]}
-          >
-            <Text style={styles.stepText}>{i < done ? '✓' : i + 1}</Text>
-          </View>
-          {i < STAGE_COUNT - 1 && <View style={[styles.stepLine, i < done && { backgroundColor: color }]} />}
-        </React.Fragment>
-      ))}
+    <View style={{ width: size * 1.9, height: size * 1.5, alignItems: 'center', justifyContent: 'center' }}>
+      <PulseRings active={listening} color={C.bad} size={size} />
+      <Pressable
+        onPress={disabled ? undefined : onPress}
+        onPressIn={() => to(0.93)}
+        onPressOut={() => to(1)}
+        accessibilityRole="button"
+        accessibilityLabel={listening ? 'Stop listening' : 'Start reading aloud'}
+      >
+        <Animated.View
+          style={[
+            styles.mic,
+            { width: size, height: size, borderRadius: size / 2, backgroundColor: listening ? C.bad : color, opacity: disabled ? 0.4 : 1 },
+            { transform: [{ scale: press }] },
+          ]}
+        >
+          <Icon name={listening ? 'stop' : 'mic'} size={size * 0.42} color={C.white} />
+        </Animated.View>
+      </Pressable>
     </View>
   );
 }
 
-// ───────────────────────── Sentence with phonetics ─────────────────────────
-function WordsView({ sentence, wordStatus, showPhonetics, onWordPress }) {
-  const words = sentence.split(/\s+/).filter(Boolean);
+// ───────────────────────── Small shared pieces ─────────────────────────
+function Header({ title, subtitle, onBack, right }) {
   return (
-    <View style={styles.wordsWrap}>
-      {words.map((w, i) => {
-        const ipa = IPA[cleanWord(w)];
-        const st = wordStatus ? wordStatus[i] : null;
-        const color = st === 'ok' ? C.good : st === 'wrong' ? C.bad : st === 'missing' ? C.warn : C.text;
+    <View style={styles.header}>
+      <Pressable onPress={onBack} hitSlop={12} accessibilityRole="button" accessibilityLabel="Back to home" style={styles.headerBack}>
+        <Icon name="chevron-back" size={26} color={C.ink} />
+      </Pressable>
+      <View style={{ flex: 1 }}>
+        <T w="bold" style={styles.headerTitle}>{title}</T>
+        {!!subtitle && <T style={styles.headerSub}>{subtitle}</T>}
+      </View>
+      {right}
+    </View>
+  );
+}
+
+function Segmented({ options, value, onChange }) {
+  return (
+    <View style={styles.segment}>
+      {options.map((o) => {
+        const on = o.value === value;
         return (
-          <TouchableOpacity key={i} style={styles.wordChip} onPress={() => onWordPress(cleanWord(w))} activeOpacity={0.6}>
-            <Text style={[styles.wordText, { color }]}>{w}</Text>
-            {showPhonetics && !!ipa && (
-              <Text style={[styles.ipaText, st ? { color } : null]}>/{ipa}/</Text>
-            )}
-          </TouchableOpacity>
+          <Pressable
+            key={String(o.value)}
+            onPress={() => onChange(o.value)}
+            style={[styles.segmentItem, on && styles.segmentItemOn]}
+            accessibilityRole="button"
+            accessibilityState={{ selected: on }}
+          >
+            <T w="semi" style={{ color: on ? C.white : C.muted, fontSize: 14 }}>{o.label}</T>
+          </Pressable>
         );
       })}
     </View>
   );
 }
 
-// ───────────────────────── Game screen ─────────────────────────
-function GameScreen({
-  diff, stageIndex, sentence, wordStatus, result, listening, heard, engineReady,
-  showPhonetics, onTogglePhonetics,
-  onMic, onHear, onHearWord, onSwap, onNext, onBack,
-}) {
-  const pop = useRef(new Animated.Value(0)).current;
-  const shake = useRef(new Animated.Value(0)).current;
-  const pulse = useRef(new Animated.Value(1)).current;
-  const isCorrect = result.kind === 'correct';
-  const lastStage = stageIndex === LAST_STAGE;
-
+function ToggleRow({ label, hint, value, onChange }) {
+  const a = useRef(new Animated.Value(value ? 1 : 0)).current;
   useEffect(() => {
-    pop.setValue(0);
-    Animated.spring(pop, { toValue: 1, friction: 6, useNativeDriver: true }).start();
-  }, [sentence, pop]);
+    Animated.timing(a, { toValue: value ? 1 : 0, duration: 160, useNativeDriver: false }).start();
+  }, [a, value]);
+  return (
+    <Pressable onPress={() => onChange(!value)} style={styles.toggleRow} accessibilityRole="switch" accessibilityState={{ checked: value }}>
+      <View style={{ flex: 1, paddingRight: 12 }}>
+        <T w="medium" style={{ fontSize: 16 }}>{label}</T>
+        {!!hint && <T style={styles.hint}>{hint}</T>}
+      </View>
+      <Animated.View style={[styles.switch, { backgroundColor: a.interpolate({ inputRange: [0, 1], outputRange: [C.line, C.teal] }) }]}>
+        <Animated.View style={[styles.switchKnob, { transform: [{ translateX: a.interpolate({ inputRange: [0, 1], outputRange: [0, 20] }) }] }]} />
+      </Animated.View>
+    </Pressable>
+  );
+}
 
+// ───────────────────────── Home ─────────────────────────
+function HomeScreen({ progress, engine, engineError, onRetryEngine, bleState, onStart, onWords, onSettings }) {
+  const trickyCount = Object.keys(progress.tricky).length;
+  const goal = Math.min(1, progress.today.done / DAILY_GOAL);
+  const flame = useRef(new Animated.Value(1)).current;
   useEffect(() => {
-    if (result.kind !== 'wrong') return;
-    shake.setValue(0);
     Animated.sequence([
-      Animated.timing(shake, { toValue: 12, duration: 60, useNativeDriver: true }),
-      Animated.timing(shake, { toValue: -12, duration: 60, useNativeDriver: true }),
-      Animated.timing(shake, { toValue: 8, duration: 60, useNativeDriver: true }),
-      Animated.timing(shake, { toValue: -8, duration: 60, useNativeDriver: true }),
-      Animated.timing(shake, { toValue: 0, duration: 60, useNativeDriver: true }),
+      Animated.delay(500),
+      Animated.spring(flame, { toValue: 1.25, friction: 3, useNativeDriver: true }),
+      Animated.spring(flame, { toValue: 1, friction: 4, useNativeDriver: true }),
     ]).start();
-  }, [result.id]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    if (!listening) return;
-    const loop = Animated.loop(
-      Animated.sequence([
-        Animated.timing(pulse, { toValue: 1.15, duration: 550, useNativeDriver: true }),
-        Animated.timing(pulse, { toValue: 1, duration: 550, useNativeDriver: true }),
-      ])
-    );
-    loop.start();
-    return () => { loop.stop(); pulse.setValue(1); };
-  }, [listening, pulse]);
-
-  const resultColor =
-    { correct: C.good, wrong: C.bad, error: C.bad, listening: C.blue }[result.kind] ?? C.muted;
+  }, [flame]);
 
   return (
     <ScrollView contentContainerStyle={styles.screen}>
-      <View style={styles.topBar}>
-        <TouchableOpacity onPress={onBack} style={styles.backBtn}>
-          <Text style={styles.backText}>‹ Menu</Text>
-        </TouchableOpacity>
-        <Text style={[styles.topTitle, { color: diff.color }]}>{diff.emoji} {diff.label}</Text>
-        <View style={{ width: 70, alignItems: 'flex-end' }}>
-          <Image source={LOGO} style={styles.topLogo} />
+      <Rise>
+        <View style={styles.homeTop}>
+          <Image source={LOGO} style={styles.homeLogo} />
+          <View style={{ flex: 1 }}>
+            <T w="bold" style={styles.appName}>Speak It Right</T>
+            <T style={styles.hint}>Read aloud. See every word you got right.</T>
+          </View>
+          <Pressable onPress={onSettings} hitSlop={10} accessibilityRole="button" accessibilityLabel="Settings" style={styles.roundBtn}>
+            <Icon name="settings-outline" size={22} color={C.ink} />
+          </Pressable>
         </View>
-      </View>
+      </Rise>
 
-      <ProgressSteps done={stageIndex + (isCorrect ? 1 : 0)} current={stageIndex} color={diff.color} />
-      <Text style={styles.levelLabel}>
-        LEVEL {stageIndex + 1} OF {STAGE_COUNT} · {STAGE_NAMES[stageIndex].toUpperCase()}
-      </Text>
-
-      <Animated.View
-        style={[
-          styles.sentenceCard,
-          { borderColor: isCorrect ? C.good : result.kind === 'wrong' ? C.bad : C.border },
-          { opacity: pop, transform: [{ scale: pop.interpolate({ inputRange: [0, 1], outputRange: [0.85, 1] }) }, { translateX: shake }] },
-        ]}
-      >
-        <WordsView
-          sentence={sentence}
-          wordStatus={wordStatus}
-          showPhonetics={showPhonetics}
-          onWordPress={onHearWord}
-        />
-      </Animated.View>
-      <Text style={styles.tapHint}>Tap any word to hear it</Text>
-
-      <View style={styles.helperRow}>
-        <TouchableOpacity style={styles.helperBtn} onPress={onHear} disabled={listening}>
-          <Text style={styles.helperText}>🔊 Hear it</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.helperBtn} onPress={onTogglePhonetics}>
-          <Text style={styles.helperText}>{showPhonetics ? '🔤 Phonetics: ON' : '🔤 Phonetics: OFF'}</Text>
-        </TouchableOpacity>
-        {!isCorrect && (
-          <TouchableOpacity style={styles.helperBtn} onPress={onSwap} disabled={listening}>
-            <Text style={styles.helperText}>🔀 Another</Text>
-          </TouchableOpacity>
-        )}
-      </View>
-
-      <Animated.View style={{ transform: [{ scale: pulse }], marginVertical: 18 }}>
-        <TouchableOpacity
-          style={[
-            styles.micButton,
-            { backgroundColor: listening ? C.bad : diff.color },
-            !engineReady && { opacity: 0.4 },
-          ]}
-          onPress={onMic}
-          disabled={isCorrect || !engineReady}
-          activeOpacity={0.85}
-        >
-          <Text style={styles.micIcon}>{listening ? '⏹' : '🎙️'}</Text>
-        </TouchableOpacity>
-      </Animated.View>
-      <Text style={styles.micHint}>
-        {!engineReady
-          ? 'Speech engine is loading…'
-          : listening
-          ? 'Listening… read the sentence (tap to stop)'
-          : isCorrect
-          ? 'Nice!'
-          : 'Tap the mic and read the sentence'}
-      </Text>
-      {listening && (
-        <Text style={styles.heardText}>{heard ? `“${heard}”` : 'Waiting for your voice…'}</Text>
+      {engine !== 'ready' && (
+        <Pressable onPress={engine === 'error' ? onRetryEngine : undefined} style={[styles.banner, engine === 'error' && { backgroundColor: C.badSoft }]}>
+          {engine === 'loading' ? <ActivityIndicator color={C.ink} style={{ marginRight: 10 }} /> : <Icon name="warning" size={20} color={C.bad} style={{ marginRight: 10 }} />}
+          <View style={{ flex: 1 }}>
+            <T w="medium" style={{ fontSize: 14, color: engine === 'error' ? C.bad : C.ink }}>
+              {engine === 'loading' ? 'Getting the offline listener ready. The first start takes a little longer.' : 'The listener could not start. Tap to try again.'}
+            </T>
+            {engine === 'error' && !!engineError && <T style={[styles.hint, { color: C.bad }]}>{engineError}</T>}
+          </View>
+        </Pressable>
       )}
 
-      <View style={[styles.resultBox, { borderColor: resultColor }]}>
-        <Text style={[styles.resultText, { color: resultColor }]}>{result.text}</Text>
-      </View>
+      <Rise delay={80}>
+        <View style={styles.todayCard}>
+          <View style={styles.todayRow}>
+            <View style={styles.todayStat}>
+              <Animated.View style={{ transform: [{ scale: flame }] }}>
+                <Icon name="flame" size={26} color={progress.streak.count > 0 ? C.gold : '#5D7799'} />
+              </Animated.View>
+              <View style={{ marginLeft: 8 }}>
+                <CountUp value={progress.streak.count} style={styles.todayNumber} />
+                <T style={styles.todayLabel}>{progress.streak.count === 1 ? 'day in a row' : 'days in a row'}</T>
+              </View>
+            </View>
+            <View style={styles.todayStat}>
+              <Icon name="flash" size={24} color={C.teal} />
+              <View style={{ marginLeft: 8 }}>
+                <CountUp value={progress.xp} style={styles.todayNumber} />
+                <T style={styles.todayLabel}>points</T>
+              </View>
+            </View>
+          </View>
+          <T w="medium" style={styles.todayGoal}>
+            {progress.today.done >= DAILY_GOAL
+              ? 'Today’s goal is done. Keep going if you like.'
+              : `Today: ${progress.today.done} of ${DAILY_GOAL} sentences`}
+          </T>
+          <Bar value={goal} color={C.teal} track="#2B4A75" />
+        </View>
+      </Rise>
 
-      {isCorrect && !lastStage && (
-        <TouchableOpacity style={[styles.nextBtn, { backgroundColor: diff.color }]} onPress={onNext}>
-          <Text style={styles.nextText}>Next level ➜</Text>
-        </TouchableOpacity>
-      )}
-      {isCorrect && lastStage && <Text style={styles.winSoon}>🏆 All {STAGE_COUNT} levels done…</Text>}
+      <Rise delay={160}>
+        <T w="semi" style={styles.sectionTitle}>Choose a level of English</T>
+      </Rise>
+      {DIFFICULTIES.map((d, i) => {
+        const row = progress.stars[d.key];
+        const done = row.every((s) => s > 0);
+        const next = nextStage(progress, d.key);
+        return (
+          <Rise key={d.key} delay={220 + i * 80}>
+            <Pressable onPress={() => onStart(d.key)} style={({ pressed }) => [styles.diffCard, pressed && { transform: [{ scale: 0.98 }] }]} accessibilityRole="button" accessibilityLabel={`${d.label}. ${d.desc}`}>
+              <View style={[styles.diffTab, { backgroundColor: d.color }]} />
+              <View style={{ flex: 1 }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <T w="bold" style={{ fontSize: 19 }}>{d.label}</T>
+                  <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                    <Icon name="star" size={15} color={C.gold} />
+                    <T w="semi" style={{ fontSize: 14, marginLeft: 4, color: C.muted }}>{totalStars(progress, d.key)}/{STAGE_COUNT * 3}</T>
+                  </View>
+                </View>
+                <T style={styles.hint}>{d.desc}</T>
+                <View style={styles.pips}>
+                  {row.map((s, k) => (
+                    <View key={k} style={[styles.pip, s > 0 && { backgroundColor: d.color, borderColor: d.color }]}>
+                      <T w="semi" style={{ fontSize: 12, color: s > 0 ? C.white : C.muted }}>{k + 1}</T>
+                    </View>
+                  ))}
+                  <T w="medium" style={[styles.hint, { marginLeft: 6, marginTop: 0, color: d.color }]}>
+                    {done ? 'Play again' : next === 0 ? 'Start' : `Continue at level ${next + 1}`}
+                  </T>
+                </View>
+              </View>
+              <Icon name="chevron-forward" size={22} color={C.muted} />
+            </Pressable>
+          </Rise>
+        );
+      })}
+
+      <Rise delay={480}>
+        <Pressable onPress={onWords} style={({ pressed }) => [styles.wordsRow, pressed && { transform: [{ scale: 0.98 }] }]} accessibilityRole="button">
+          <View style={styles.wordsIcon}><Icon name="bookmark" size={20} color={C.tealDeep} /></View>
+          <View style={{ flex: 1 }}>
+            <T w="semi" style={{ fontSize: 16 }}>Tricky words</T>
+            <T style={styles.hint}>
+              {trickyCount === 0 ? 'Words you miss are saved here to practise.' : `${trickyCount} ${trickyCount === 1 ? 'word' : 'words'} to practise`}
+            </T>
+          </View>
+          <Icon name="chevron-forward" size={22} color={C.muted} />
+        </Pressable>
+      </Rise>
+
+      <Rise delay={560}>
+        <View style={styles.footer}>
+          <View style={styles.chip}>
+            <Icon name="bluetooth" size={14} color={bleState === 'connected' ? C.good : C.muted} />
+            <T w="medium" style={{ fontSize: 12, marginLeft: 4, color: bleState === 'connected' ? C.good : C.muted }}>
+              {bleState === 'connected' ? 'Lights connected' : 'Lights not connected'}
+            </T>
+          </View>
+          <T style={styles.credit}>{CREDIT}</T>
+        </View>
+      </Rise>
     </ScrollView>
   );
 }
 
-// ───────────────────────── Win screen ─────────────────────────
-function WinScreen({ diff, mistakes, nextDiff, onAgain, onNextDiff, onHome }) {
-  const stars = mistakes === 0 ? 3 : mistakes <= 3 ? 2 : 1;
-  const starAnims = useRef([0, 1, 2].map(() => new Animated.Value(0))).current;
-  const bounce = useRef(new Animated.Value(0)).current;
-
+// ───────────────────────── Play ─────────────────────────
+function PlayScreen({
+  diff, stageIndex, runStars, sentence, marks, lit, heardFor, result, listening, heard, engineReady,
+  settings, onTogglePhonetics, onMic, onHear, onHearWord, onSwap, onNext, onBack,
+}) {
+  const passed = result.kind === 'pass';
+  const lastStage = stageIndex === LAST_STAGE;
+  const shake = useRef(new Animated.Value(0)).current;
   useEffect(() => {
-    Animated.stagger(
-      250,
-      starAnims.map((a) => Animated.spring(a, { toValue: 1, friction: 4, useNativeDriver: true }))
-    ).start();
-    const loop = Animated.loop(
-      Animated.sequence([
-        Animated.timing(bounce, { toValue: -14, duration: 600, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
-        Animated.timing(bounce, { toValue: 0, duration: 600, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
-      ])
-    );
-    loop.start();
-    return () => loop.stop();
-  }, [starAnims, bounce]);
+    if (result.kind !== 'fail') return;
+    shake.setValue(0);
+    Animated.sequence([10, -10, 6, -6, 0].map((v) => Animated.timing(shake, { toValue: v, duration: 55, useNativeDriver: true }))).start();
+  }, [result.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <View style={{ flex: 1 }}>
-      <Confetti />
-      <ScrollView contentContainerStyle={[styles.screen, { justifyContent: 'center', flexGrow: 1 }]}>
-        <Animated.Text style={[styles.trophy, { transform: [{ translateY: bounce }] }]}>🏆</Animated.Text>
-        <Text style={[styles.winTitle, { color: diff.color }]}>YOU WIN!</Text>
-        <Text style={styles.winSub}>You finished all {STAGE_COUNT} {diff.label} levels</Text>
+    <ScrollView contentContainerStyle={styles.screen}>
+      <Header title={diff.label} subtitle={`Level ${stageIndex + 1} of ${STAGE_COUNT}: ${STAGE_NAMES[stageIndex]}`} onBack={onBack} />
 
-        <View style={styles.starsRow}>
-          {starAnims.map((a, i) => (
-            <Animated.Text key={i} style={[styles.star, { transform: [{ scale: a }], opacity: a }]}>
-              {i < stars ? '⭐' : '☆'}
-            </Animated.Text>
-          ))}
+      <View style={styles.steps}>
+        {Array.from({ length: STAGE_COUNT }, (_, i) => {
+          const cleared = i < stageIndex || (i === stageIndex && passed);
+          return (
+            <React.Fragment key={i}>
+              <View style={[styles.step, cleared && { backgroundColor: diff.color, borderColor: diff.color }, i === stageIndex && !cleared && { borderColor: diff.color, borderWidth: 3 }]}>
+                {cleared ? <Icon name="checkmark" size={16} color={C.white} /> : <T w="semi" style={{ fontSize: 13, color: i === stageIndex ? diff.color : C.muted }}>{i + 1}</T>}
+              </View>
+              {i < STAGE_COUNT - 1 && <View style={[styles.stepLine, i < stageIndex && { backgroundColor: diff.color }]} />}
+            </React.Fragment>
+          );
+        })}
+      </View>
+
+      <Animated.View style={{ transform: [{ translateX: shake }] }}>
+        <ReadingCard
+          sentence={sentence}
+          marks={marks}
+          lit={lit}
+          heardFor={heardFor}
+          showPhonetics={settings.phonetics}
+          onWordPress={onHearWord}
+          tone={passed ? 'pass' : result.kind === 'fail' ? 'fail' : null}
+        />
+      </Animated.View>
+
+      <View style={styles.tools}>
+        <Button small icon="volume-high" label="Listen" color={C.card} edge={C.line} textColor={C.ink} onPress={() => onHear(false)} disabled={listening} />
+        <Button small icon="hourglass-outline" label="Slowly" color={C.card} edge={C.line} textColor={C.ink} onPress={() => onHear(true)} disabled={listening} />
+        <Button small icon={settings.phonetics ? 'eye' : 'eye-off'} label="Sounds" color={C.card} edge={C.line} textColor={C.ink} onPress={onTogglePhonetics} />
+        {!passed && <Button small icon="shuffle" label="Another" color={C.card} edge={C.line} textColor={C.ink} onPress={onSwap} disabled={listening} />}
+      </View>
+
+      {!passed && (
+        <View style={{ alignItems: 'center' }}>
+          <MicButton listening={listening} color={C.ink} disabled={!engineReady} onPress={onMic} />
+          <T w="medium" style={styles.micHint}>
+            {!engineReady
+              ? 'The listener is still getting ready'
+              : listening
+              ? 'Listening. Take your time, tap when you finish.'
+              : result.kind === 'fail' || result.kind === 'error'
+              ? 'Tap the microphone to try again'
+              : 'Tap the microphone and read the sentence'}
+          </T>
+          {listening && <T style={styles.heardText}>{heard ? `“${heard}”` : ' '}</T>}
         </View>
-        <Text style={styles.winStats}>
-          {mistakes === 0 ? 'Perfect run – no mistakes!' : `${mistakes} mistake${mistakes === 1 ? '' : 's'} along the way`}
-        </Text>
+      )}
 
-        <TouchableOpacity style={[styles.nextBtn, { backgroundColor: diff.color, width: '100%' }]} onPress={onAgain}>
-          <Text style={styles.nextText}>🔁 Play again</Text>
-        </TouchableOpacity>
-        {nextDiff && (
-          <TouchableOpacity style={[styles.nextBtn, { backgroundColor: nextDiff.color, width: '100%' }]} onPress={onNextDiff}>
-            <Text style={styles.nextText}>{nextDiff.emoji} Try {nextDiff.label}</Text>
-          </TouchableOpacity>
-        )}
-        <TouchableOpacity style={[styles.nextBtn, { backgroundColor: C.card, borderWidth: 1, borderColor: C.border, width: '100%' }]} onPress={onHome}>
-          <Text style={styles.nextText}>🏠 Menu</Text>
-        </TouchableOpacity>
-        <Image source={LOGO} style={[styles.topLogo, { marginTop: 22 }]} />
-        <Text style={styles.credit}>{CREDIT}</Text>
+      {(result.kind === 'pass' || result.kind === 'fail') && (
+        <Rise key={result.id}>
+          <View style={[styles.resultCard, { borderColor: passed ? C.good : C.bad }]}>
+            <View style={styles.resultTop}>
+              <CountUp value={result.percent} suffix="%" style={[styles.resultPercent, { color: passed ? C.good : C.bad }]} />
+              <View style={{ flex: 1, marginLeft: 14 }}>
+                <T w="bold" style={{ fontSize: 18, color: passed ? C.good : C.bad }}>{result.title}</T>
+                {passed ? <Stars count={result.stars} size={24} animate /> : <T style={styles.hint}>You need {Math.round(settings.passMark * 100)}% to pass</T>}
+              </View>
+              {passed && (
+                <View style={styles.xpChip}>
+                  <T w="bold" style={{ color: C.tealDeep, fontSize: 14 }}>+{result.xp}</T>
+                </View>
+              )}
+            </View>
+            <Bar value={result.percent / 100} color={passed ? C.good : C.bad} mark={settings.passMark < 1 ? settings.passMark : undefined} />
+            {!!result.text && <T style={styles.resultText}>{result.text}</T>}
+            {!!marks && marks.some((m) => m !== 'ok') && (
+            <View style={styles.legend}>
+              {[['ok', 'right'], ['close', 'almost'], ['wrong', 'missed']].map(([k, label]) => (
+                <View key={k} style={styles.legendItem}>
+                  <View style={[styles.legendDot, { backgroundColor: MARK_COLORS[k].fg }]} />
+                  <T style={{ fontSize: 12, color: C.muted }}>{label}</T>
+                </View>
+              ))}
+            </View>
+            )}
+          </View>
+        </Rise>
+      )}
+      {result.kind === 'error' && (
+        <View style={[styles.resultCard, { borderColor: C.line }]}>
+          <T w="medium" style={{ fontSize: 15 }}>{result.title}</T>
+          {!!result.text && <T style={styles.hint}>{result.text}</T>}
+        </View>
+      )}
+
+      {passed && (
+        <Button
+          label={lastStage ? 'See your result' : 'Next level'}
+          icon="arrow-forward"
+          color={diff.color}
+          edge={diff.edge}
+          onPress={onNext}
+          style={{ marginTop: 16 }}
+        />
+      )}
+      {runStars.some((s) => s > 0) && (
+        <T style={[styles.hint, { textAlign: 'center', marginTop: 14 }]}>
+          Stars this round: {runStars.reduce((a, b) => a + b, 0)}
+        </T>
+      )}
+    </ScrollView>
+  );
+}
+
+// ───────────────────────── Win ─────────────────────────
+function WinScreen({ diff, runStars, nextDiff, onAgain, onNextDiff, onHome }) {
+  const total = runStars.reduce((a, b) => a + b, 0);
+  const lift = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.spring(lift, { toValue: 1, friction: 4, tension: 60, useNativeDriver: true }).start();
+  }, [lift]);
+  return (
+    <View style={{ flex: 1 }}>
+      <ScrollView contentContainerStyle={[styles.screen, { alignItems: 'center' }]}>
+        <Animated.View style={[styles.trophy, { backgroundColor: diff.color, transform: [{ scale: lift }] }]}>
+          <Icon name="trophy" size={64} color={C.white} />
+        </Animated.View>
+        <T w="bold" style={styles.winTitle}>You win!</T>
+        <T style={[styles.hint, { fontSize: 16, textAlign: 'center' }]}>You read all {STAGE_COUNT} {diff.label} levels.</T>
+
+        <View style={styles.winCard}>
+          {runStars.map((s, i) => (
+            <View key={i} style={styles.winRow}>
+              <T w="medium" style={{ fontSize: 15, flex: 1 }}>{i + 1}. {STAGE_NAMES[i]}</T>
+              <Stars count={s} size={20} />
+            </View>
+          ))}
+          <View style={[styles.winRow, { borderTopWidth: 1, borderTopColor: C.line, marginTop: 6, paddingTop: 12 }]}>
+            <T w="bold" style={{ fontSize: 16, flex: 1 }}>Stars this round</T>
+            <CountUp value={total} suffix={` of ${STAGE_COUNT * 3}`} style={{ fontSize: 16, color: C.tealDeep }} />
+          </View>
+        </View>
+
+        <View style={{ alignSelf: 'stretch' }}>
+          <Button label="Play again" icon="refresh" color={diff.color} edge={diff.edge} onPress={onAgain} style={{ marginTop: 8 }} />
+          {nextDiff && <Button label={`Try ${nextDiff.label}`} icon="arrow-up" color={nextDiff.color} edge={nextDiff.edge} onPress={onNextDiff} style={{ marginTop: 12 }} />}
+          <Button label="Home" icon="home" color={C.card} edge={C.line} textColor={C.ink} onPress={onHome} style={{ marginTop: 12 }} />
+        </View>
+        <Image source={LOGO} style={{ width: 44, height: 44, marginTop: 24 }} />
+        <T style={styles.credit}>{CREDIT}</T>
       </ScrollView>
+      <Confetti />
     </View>
   );
 }
 
+// ───────────────────────── Tricky words ─────────────────────────
+function WordsScreen({ tricky, selected, onSelect, result, listening, engineReady, onMic, onHear, onBack }) {
+  const words = Object.keys(tricky).sort((a, b) => tricky[b].misses - tricky[a].misses || a.localeCompare(b));
+  const current = selected && tricky[selected] ? selected : null;
+
+  return (
+    <ScrollView contentContainerStyle={styles.screen}>
+      <Header title="Tricky words" subtitle={`Say a word right ${MASTER_AFTER} times to clear it`} onBack={onBack} />
+
+      {words.length === 0 && (
+        <View style={styles.emptyCard}>
+          <Icon name="checkmark-circle" size={44} color={C.good} />
+          <T w="semi" style={{ fontSize: 18, marginTop: 10, textAlign: 'center' }}>
+            {result.kind === 'pass' ? 'All cleared' : 'No tricky words yet'}
+          </T>
+          <T style={[styles.hint, { textAlign: 'center' }]}>
+            When you miss a word while reading, it is saved here so you can practise it alone.
+          </T>
+          <Button label="Read a sentence" icon="book" onPress={onBack} style={{ marginTop: 16, alignSelf: 'stretch' }} />
+        </View>
+      )}
+
+      {current && (
+        <View style={styles.practiceCard}>
+          <T w="bold" style={styles.practiceWord}>{current}</T>
+          {!!IPA[current] && <T style={styles.practiceIpa}>/{IPA[current]}/</T>}
+          <View style={styles.winsRow}>
+            {Array.from({ length: MASTER_AFTER }, (_, i) => (
+              <View key={i} style={[styles.winDot, i < tricky[current].wins && { backgroundColor: C.good, borderColor: C.good }]} />
+            ))}
+          </View>
+          <View style={[styles.tools, { justifyContent: 'center' }]}>
+            <Button small icon="volume-high" label="Listen" color={C.card} edge={C.line} textColor={C.ink} onPress={() => onHear(current, false)} disabled={listening} />
+            <Button small icon="hourglass-outline" label="Slowly" color={C.card} edge={C.line} textColor={C.ink} onPress={() => onHear(current, true)} disabled={listening} />
+          </View>
+          <MicButton listening={listening} color={C.teal} disabled={!engineReady} onPress={onMic} size={76} />
+          <T
+            w="medium"
+            style={[styles.micHint, result.kind === 'pass' && { color: C.good }, result.kind === 'fail' && { color: C.bad }]}
+          >
+            {listening ? 'Listening. Say the word.' : result.title || 'Tap the microphone and say the word'}
+          </T>
+        </View>
+      )}
+
+      {!current && words.length > 0 && result.kind === 'pass' && (
+        <View style={[styles.practiceCard, { borderColor: C.good }]}>
+          <Icon name="checkmark-circle" size={40} color={C.good} />
+          <T w="semi" style={{ fontSize: 17, marginTop: 8, textAlign: 'center', color: C.good }}>{result.title}</T>
+        </View>
+      )}
+
+      {words.length > 0 && (
+        <>
+          <T w="semi" style={styles.sectionTitle}>Your words</T>
+          <View style={styles.chipWrap}>
+            {words.map((w) => (
+              <Pressable
+                key={w}
+                onPress={() => onSelect(w)}
+                style={[styles.wordChip, w === current && styles.wordChipOn]}
+                accessibilityRole="button"
+                accessibilityState={{ selected: w === current }}
+              >
+                <T w="semi" style={{ fontSize: 15, color: w === current ? C.white : C.ink }}>{w}</T>
+                <T style={{ fontSize: 11, marginLeft: 6, color: w === current ? '#CFE0F5' : C.muted }}>missed {tricky[w].misses}×</T>
+              </Pressable>
+            ))}
+          </View>
+        </>
+      )}
+    </ScrollView>
+  );
+}
+
+// ───────────────────────── Settings ─────────────────────────
+function SettingsScreen({ settings, onChange, bleState, onBle, onReset, onBack }) {
+  const busy = bleState === 'scanning' || bleState === 'connecting';
+  const mark = PASS_MARKS.find((m) => m.value === settings.passMark) || PASS_MARKS[1];
+  return (
+    <ScrollView contentContainerStyle={styles.screen}>
+      <Header title="Settings" onBack={onBack} />
+
+      <View style={styles.settingsCard}>
+        <T w="semi" style={styles.settingsTitle}>How the app listens</T>
+        <Segmented
+          options={Object.keys(MODES).map((k) => ({ value: k, label: MODES[k].label }))}
+          value={settings.mode}
+          onChange={(v) => onChange({ mode: v })}
+        />
+        <T style={styles.hint}>{MODES[settings.mode].desc}</T>
+      </View>
+
+      <View style={styles.settingsCard}>
+        <T w="semi" style={styles.settingsTitle}>How much must be right to pass</T>
+        <Segmented options={PASS_MARKS} value={mark.value} onChange={(v) => onChange({ passMark: v })} />
+        <T style={styles.hint}>
+          {mark.label}: {mark.desc}. A word that is almost right (like “plants” for “plant”) counts for part of a word.
+        </T>
+      </View>
+
+      <View style={styles.settingsCard}>
+        <ToggleRow label="Show sounds under words" hint="The pronunciation of each word, in phonetic letters" value={settings.phonetics} onChange={(v) => onChange({ phonetics: v })} />
+        <View style={styles.divider} />
+        <ToggleRow label="Always speak slowly" hint="The Listen button reads at a slower speed" value={settings.slowVoice} onChange={(v) => onChange({ slowVoice: v })} />
+      </View>
+
+      <View style={styles.settingsCard}>
+        <T w="semi" style={styles.settingsTitle}>ESP32 lights</T>
+        <T style={[styles.hint, { marginBottom: 12 }]}>Green for a correct reading, red for a wrong one.</T>
+        <Button
+          label={{ disconnected: 'Connect the lights', scanning: 'Searching…', connecting: 'Connecting…', connected: 'Connected. Tap to disconnect' }[bleState]}
+          icon="bluetooth"
+          color={bleState === 'connected' ? C.good : C.ink}
+          edge={bleState === 'connected' ? '#147647' : C.inkDeep}
+          onPress={onBle}
+          disabled={busy}
+        />
+      </View>
+
+      <Button label="Erase my progress" icon="trash-outline" color={C.card} edge={C.line} textColor={C.bad} onPress={onReset} />
+      <T style={[styles.credit, { marginTop: 22 }]}>{CREDIT}</T>
+    </ScrollView>
+  );
+}
+
 // ───────────────────────── App ─────────────────────────
+const IDLE = { kind: 'idle', id: 0 };
+
 export default function App() {
-  const [screen, setScreen] = useState('home'); // 'home' | 'game' | 'win'
+  const [fontsLoaded, fontError] = useFonts({ Lexend_400Regular, Lexend_500Medium, Lexend_600SemiBold, Lexend_700Bold });
+  setFontsReady(fontsLoaded && !fontError);
+
+  const [screen, setScreen] = useState('home'); // home | play | win | words | settings
+  const [progress, setProgress] = useState(defaultProgress);
   const [diffKey, setDiffKey] = useState('Beginner');
   const [stageIndex, setStageIndex] = useState(0);
+  const [runStars, setRunStars] = useState(() => new Array(STAGE_COUNT).fill(0));
   const [sentence, setSentence] = useState('');
-  const [wordStatus, setWordStatus] = useState(null); // per-word 'ok' | 'wrong' | 'missing'
-  const [result, setResult] = useState({ kind: 'idle', text: 'Ready when you are!', id: 0 });
+  const [marks, setMarks] = useState(null);       // per word: ok | close | wrong | missing
+  const [heardFor, setHeardFor] = useState(null); // per word: what was heard instead
+  const [lit, setLit] = useState(null);           // per word: heard so far (live)
+  const [result, setResult] = useState(IDLE);
   const [listening, setListening] = useState(false);
   const [heard, setHeard] = useState('');
-  const [mistakes, setMistakes] = useState(0);
+  const [trickyWord, setTrickyWord] = useState(null);
   const [bleState, setBleState] = useState('disconnected');
-  const [completed, setCompleted] = useState({});
-  const [engine, setEngine] = useState('loading'); // 'loading' | 'ready' | 'error'
+  const [engine, setEngine] = useState('loading'); // loading | ready | error
   const [engineError, setEngineError] = useState('');
-  const [mode, setMode] = useState('guided'); // 'guided' | 'detailed'
-  const [showPhonetics, setShowPhonetics] = useState(true);
 
   const managerRef = useRef(null);
   if (!managerRef.current) managerRef.current = new BleManager();
   const deviceRef = useRef(null);
-  const sentenceRef = useRef('');
-  sentenceRef.current = sentence;
   const handlersRef = useRef({});
   const timerRef = useRef(null);
   const resultId = useRef(0);
+  const attemptsRef = useRef(0);
   const sessionRef = useRef({ active: false, done: true });
 
-  const makeResult = (kind, text) => ({ kind, text, id: ++resultId.current });
+  const settings = progress.settings;
   const diff = DIFFICULTIES.find((d) => d.key === diffKey);
+  const makeResult = (r) => ({ ...r, id: ++resultId.current });
 
-  // ── BLE ──
+  // ── Saved progress ──
+  useEffect(() => { setProgress(loadProgress()); }, []);
+  const update = useCallback((fn) => {
+    setProgress((prev) => {
+      const next = fn(prev);
+      saveProgress(next);
+      return next;
+    });
+  }, []);
+  const changeSettings = (patch) => update((p) => ({ ...p, settings: { ...p.settings, ...patch } }));
+
+  // ── ESP32 lights (Bluetooth) ──
   const sendCommand = useCallback(async (cmd) => {
     const device = deviceRef.current;
     if (!device) return false;
@@ -501,7 +746,7 @@ export default function App() {
       manager.stopDeviceScan();
       if (!found) {
         setBleState('disconnected');
-        Alert.alert('Not found', 'Could not find "SpeakItRight". Is the ESP32 powered on?');
+        Alert.alert('Not found', 'Could not find “SpeakItRight”. Is the ESP32 powered on?');
       }
     }, SCAN_TIMEOUT_MS);
 
@@ -545,6 +790,13 @@ export default function App() {
       });
   }, []);
 
+  const clearSessionTimers = (s) => {
+    clearTimeout(s.pauseTimer);
+    clearTimeout(s.stopTimer);
+    clearTimeout(s.hardTimer);
+    clearTimeout(s.emptyTimer);
+  };
+
   useEffect(() => {
     loadEngine();
     const subs = [
@@ -558,8 +810,7 @@ export default function App() {
     return () => {
       subs.forEach((s) => s?.remove?.());
       clearTimeout(timerRef.current);
-      clearTimeout(sessionRef.current.silenceTimer);
-      clearTimeout(sessionRef.current.stopTimer);
+      clearSessionTimers(sessionRef.current);
       Speech.stop();
       try { Vosk.unload(); } catch {}
       deviceRef.current?.cancelConnection().catch(() => {});
@@ -567,226 +818,256 @@ export default function App() {
     };
   }, [loadEngine]);
 
-  // ── What happens when a reading is judged correct ──
-  const onSuccess = (note) => {
-    setResult(makeResult('correct', stageIndex === LAST_STAGE ? '🎉 PERFECT! Final level cleared!' : `✅ Correct! Well done.${note || ''}`));
-    Vibration.vibrate(80);
-    sendCommand('correct');
-    if (stageIndex === LAST_STAGE) {
-      timerRef.current = setTimeout(() => {
-        setCompleted((prev) => ({ ...prev, [diffKey]: true }));
-        setScreen('win');
-        sendCommand('win');
-      }, 1400);
-    }
-  };
-
-  // ── Judge what the recognizer heard (re-created each render so it never goes stale) ──
-  const judge = (s) => {
-    const target = sentenceRef.current;
-    const guided = s.mode === 'guided';
-    const heardText = s.segments.join(' ').trim();
-    const heardTokens = tokenizeHeard(heardText);
-    const partialTokens = tokenizeHeard(s.bestPartial);
-
-    if (!heardTokens.length && !partialTokens.length) {
-      setWordStatus(null);
-      setResult(makeResult('error', "🤔 I didn't hear a clear sentence.\nMove closer to the phone and try again."));
-      return;
-    }
-
-    const res = evaluate(target, heardText, { minAccuracy: guided ? 1 : DETAILED_MIN_ACCURACY });
-    if (res.passed) {
-      setWordStatus(res.wordStatus);
-      onSuccess(res.wrongWords.length ? `\n(Close enough: ${res.wrongWords.join(', ')})` : '');
-      return;
-    }
-
-    // Not correct → show exactly which words went wrong
-    const words = target.split(/\s+/).filter(Boolean);
-    setMistakes((m) => m + 1);
-    Vibration.vibrate([0, 60, 60, 60]);
-    sendCommand('wrong');
-
-    if (guided) {
-      // The guided recognizer only follows the target sentence, so the words it got to
-      // show how far the person came; the next word is where they got stuck.
-      const basis = heardTokens.length ? heardText : s.bestPartial;
-      const statuses = markStuckWord(evaluate(target, basis).wordStatus);
-      setWordStatus(statuses);
-      const idx = statuses.findIndex((x) => x !== 'ok');
-      setResult(
-        makeResult(
-          'wrong',
-          idx >= 0
-            ? `❌ Not quite – I lost you at “${words[idx].replace(/[.,!?]/g, '')}”.\nTap the word to hear it, then try again.`
-            : '❌ Not quite. Listen again and try once more.'
-        )
-      );
-    } else {
-      setWordStatus(res.wordStatus);
-      const total = res.wordStatus.length;
-      const okCount = res.wordStatus.filter((x) => x === 'ok').length;
-      let text = `❌ ${okCount} of ${total} words correct (${Math.round(res.accuracy * 100)}%)`;
-      if (res.wrongWords.length) text += `\nCheck: ${res.wrongWords.join(', ').replace(/[.,!?]/g, '')}`;
-      if (res.extraWords.length) text += `\nExtra words: ${res.extraWords.join(' ')}`;
-      text += `\nI heard: “${res.heardTokens.join(' ')}”`;
-      setResult(makeResult('wrong', text));
-    }
-  };
+  // ── One listening session (used for sentences and for single words) ──
+  // The mic stays open while the person reads. Pieces of speech are collected, so a pause in
+  // the middle of the sentence does NOT end the reading. It ends when the whole target was
+  // heard, after a longer silence, when the mic is tapped again, or at the time limit.
+  const heardSoFar = (s) => [...s.segments, s.pending].filter(Boolean).join(' ');
 
   const finishSession = () => {
     const s = sessionRef.current;
     if (s.done) return;
     s.done = true;
     s.active = false;
-    clearTimeout(s.silenceTimer);
-    clearTimeout(s.stopTimer);
+    clearSessionTimers(s);
     try { Vosk.stop(); } catch {}
     setListening(false);
     setHeard('');
-    judge(s);
+    setLit(null);
+    s.onDone(heardSoFar(s));
   };
 
-  const failSession = (message) => {
+  const cancelSession = () => {
     const s = sessionRef.current;
-    s.done = true;
     s.active = false;
-    clearTimeout(s.silenceTimer);
-    clearTimeout(s.stopTimer);
+    s.done = true;
+    clearSessionTimers(s);
     try { Vosk.stop(); } catch {}
     setListening(false);
     setHeard('');
-    setResult(makeResult('error', message));
+    setLit(null);
+  };
+
+  const afterSpeech = (s) => {
+    const text = heardSoFar(s);
+    setHeard(text.replace(/\[unk\]/g, '…'));
+    s.onLive?.(text);
+    clearTimeout(s.pauseTimer);
+    if (!heardWords(text).length) return;            // nothing real yet: keep waiting
+    clearTimeout(s.emptyTimer);
+    if (s.isComplete(text)) s.pauseTimer = setTimeout(finishSession, 350);
+    else s.pauseTimer = setTimeout(finishSession, PAUSE_AFTER_SPEECH_MS);
   };
 
   handlersRef.current = {
     partial: (text) => {
       const s = sessionRef.current;
-      if (!s.active) return;
-      setHeard(text);
-      if (tokenizeHeard(text).length >= tokenizeHeard(s.bestPartial).length) s.bestPartial = text;
-      clearTimeout(s.silenceTimer); // still talking
+      if (!s.active || text === s.pending) return;
+      s.pending = text || '';
+      afterSpeech(s);
     },
     result: (text) => {
       const s = sessionRef.current;
       if (!s.active) return;
-      if (s.mode === 'guided') {
-        // Ignore a lone noise blip right after pressing the mic
-        const nothingYet = !tokenizeHeard(text).length && !s.bestPartial;
-        if (nothingYet && Date.now() - s.startedAt < 1500) return;
-        s.segments.push(text);
-        finishSession();
-        return;
-      }
-      // Detailed: collect pieces until the sentence is complete or the person goes quiet
-      s.segments.push(text);
-      clearTimeout(s.silenceTimer);
-      const total = tokenizeHeard(s.segments.join(' ')).length;
-      s.silenceTimer = setTimeout(finishSession, total >= s.targetCount ? 300 : 2200);
+      s.pending = '';
+      if (text) s.segments.push(text);
+      afterSpeech(s);
     },
     final: (text) => {
       const s = sessionRef.current;
       if (s.done || !s.stopping) return;
+      s.pending = '';
       if (text) s.segments.push(text);
       finishSession();
     },
     timeout: () => finishSession(),
     error: (e) => {
       console.warn('Vosk error', e);
-      if (sessionRef.current.done) return;
-      failSession('Speech engine error. Please try again.');
+      const s = sessionRef.current;
+      if (s.done) return;
+      cancelSession();
+      setResult(makeResult({ kind: 'error', title: 'The listener stopped unexpectedly.', text: 'Tap the microphone to try again.' }));
     },
   };
 
-  // ── Microphone button ──
-  const toggleListening = async () => {
+  const listen = async ({ target, guided, onLive, onDone }) => {
     const s = sessionRef.current;
-
-    // Tap while listening = stop and check what was heard
     if (s.active) {
+      // Tap while listening = "I am finished"
       s.stopping = true;
-      setResult(makeResult('idle', 'Checking what you said…'));
       try { Vosk.stop(); } catch {}
-      s.stopTimer = setTimeout(finishSession, 700); // wait briefly for the final result
+      s.stopTimer = setTimeout(finishSession, 700); // wait briefly for the last words
       return;
     }
-
-    if (engine !== 'ready') {
-      setResult(makeResult('error', 'The speech engine is not ready yet.'));
-      return;
-    }
+    if (engine !== 'ready') return;
     if (!(await requestMicPermission())) {
-      Alert.alert('Microphone needed', 'Please allow microphone access to read aloud.');
+      Alert.alert('Microphone needed', 'Please allow the microphone so the app can hear you read.');
       return;
     }
 
     Speech.stop();
-    const target = sentenceRef.current;
-    sessionRef.current = {
-      active: true, done: false, stopping: false, mode,
-      segments: [], bestPartial: '', startedAt: Date.now(),
-      targetCount: target.split(/\s+/).filter(Boolean).length,
-      silenceTimer: null, stopTimer: null,
+    const session = {
+      active: true, done: false, stopping: false,
+      segments: [], pending: '',
+      onLive, onDone,
+      isComplete: (text) => evaluate(target, text, { passMark: 1 }).score >= 0.999,
     };
-    setWordStatus(null);
+    sessionRef.current = session;
+    setMarks(null);
+    setHeardFor(null);
     setHeard('');
     setListening(true);
-    setResult(makeResult('listening', '🎙️ Listening… read the sentence'));
+    setResult(makeResult({ kind: 'listening' }));
+    session.hardTimer = setTimeout(finishSession, MAX_LISTEN_MS + 500);
+    session.emptyTimer = setTimeout(finishSession, NOTHING_HEARD_MS);
 
     try {
-      const options = { timeout: LISTEN_TIMEOUT_MS };
-      // Guided: the recognizer only listens for THIS sentence (much more accurate)
-      if (mode === 'guided') options.grammar = [toGrammarPhrase(target), '[unk]'];
+      const options = { timeout: MAX_LISTEN_MS };
+      // Guided: the recognizer only listens for the words of THIS target
+      if (guided) options.grammar = [toGrammarPhrase(target), '[unk]'];
       await Vosk.start(options);
     } catch (e) {
       console.warn('Vosk.start failed', e);
-      failSession('Could not start the microphone. Please try again.');
+      cancelSession();
+      setResult(makeResult({ kind: 'error', title: 'The microphone could not start.', text: 'Close other apps that use the microphone and try again.' }));
     }
   };
 
-  // ── Game flow ──
-  const stopAudio = () => {
-    Speech.stop();
-    const s = sessionRef.current;
-    s.active = false;
-    s.done = true;
-    clearTimeout(s.silenceTimer);
-    clearTimeout(s.stopTimer);
-    try { Vosk.stop(); } catch {}
-    setListening(false);
-    setHeard('');
+  // ── Reading a sentence ──
+  const judgeSentence = (text) => {
+    if (!heardWords(text).length) {
+      setResult(makeResult({ kind: 'error', title: 'I did not hear any words.', text: 'Hold the phone closer and speak a little louder.' }));
+      return;
+    }
+    attemptsRef.current += 1;
+    const res = evaluate(sentence, text, { passMark: settings.passMark });
+    setMarks(res.wordStatus);
+    setHeardFor(res.wordHeard);
+
+    const words = sentence.split(/\s+/).filter(Boolean).map(cleanWord);
+    const missed = words.filter((_, i) => res.wordStatus[i] === 'wrong' || res.wordStatus[i] === 'missing');
+    const readWell = words.filter((_, i) => res.wordStatus[i] === 'ok');
+
+    if (res.passed) {
+      const stars = starsFor(res.percent, attemptsRef.current);
+      const xp = 10 + stars * 5;
+      update((p) => recordWords(recordPass(p, { diffKey, stageIndex, stars, xp }), { missed, readWell }));
+      setRunStars((prev) => prev.map((v, i) => (i === stageIndex ? stars : v)));
+      const note = res.closeWords.length
+        ? `Almost right: ${res.closeWords.join(', ')}. Tap a word to hear it.`
+        : missed.length
+        ? `Saved to tricky words: ${missed.join(', ')}.`
+        : '';
+      setResult(makeResult({
+        kind: 'pass', percent: res.percent, stars, xp, text: note,
+        title: res.percent === 100 ? 'Perfect reading' : stageIndex === LAST_STAGE ? 'Final level cleared' : 'Well read',
+      }));
+      Vibration.vibrate(80);
+      sendCommand('correct');
+    } else {
+      update((p) => recordWords(p, { missed, readWell: [] }));
+      const parts = [];
+      if (missed.length) parts.push(`Practise: ${missed.join(', ')}.`);
+      if (res.closeWords.length) parts.push(`Almost right: ${res.closeWords.join(', ')}.`);
+      if (res.extraWords.length) parts.push(`Extra words heard: ${res.extraWords.join(' ')}.`);
+      parts.push('Tap a red word to hear it, then try again.');
+      setResult(makeResult({ kind: 'fail', percent: res.percent, title: res.percent >= 60 ? 'Nearly there' : 'Not yet', text: parts.join(' ') }));
+      Vibration.vibrate([0, 60, 60, 60]);
+      sendCommand('wrong');
+    }
+  };
+
+  const micForSentence = () =>
+    listen({
+      target: sentence,
+      guided: settings.mode === 'guided',
+      onLive: (text) => setLit(liveProgress(sentence, text)),
+      onDone: judgeSentence,
+    });
+
+  // ── Practising one tricky word ──
+  const judgeWord = (text) => {
+    const word = trickyWord;
+    if (!word) return;
+    const said = heardWords(text);
+    const res = evaluate(word, text, { passMark: 0.85 });
+    if (res.passed) {
+      const wins = (progress.tricky[word]?.wins || 0) + 1;
+      const cleared = wins >= MASTER_AFTER;
+      update((p) => {
+        const next = recordWords(p, { readWell: [word] });
+        return cleared ? { ...next, xp: next.xp + 5 } : next;
+      });
+      setResult(makeResult({ kind: 'pass', title: cleared ? `“${word}” is cleared. +5 points` : 'Right. Say it once more to clear it.' }));
+      Vibration.vibrate(80);
+      sendCommand('correct');
+      if (cleared) {
+        const rest = Object.keys(progress.tricky).filter((w) => w !== word);
+        timerRef.current = setTimeout(() => setTrickyWord(rest[0] || null), 900);
+      }
+    } else {
+      setResult(makeResult({
+        kind: 'fail',
+        title: said.length ? `Not yet. I heard “${said.join(' ')}”.` : 'That was not clear. Listen, then try again.',
+      }));
+      Vibration.vibrate([0, 60, 60, 60]);
+      sendCommand('wrong');
+    }
+  };
+
+  const micForWord = () => {
+    if (!trickyWord) return;
+    listen({ target: trickyWord, guided: true, onDone: judgeWord });
+  };
+
+  // ── Moving between sentences, levels and screens ──
+  const resetReading = () => {
+    setMarks(null);
+    setHeardFor(null);
+    setLit(null);
+    setResult(IDLE);
+    attemptsRef.current = 0;
+    sendCommand('reset');
   };
 
   const startGame = (key) => {
     clearTimeout(timerRef.current);
-    stopAudio();
+    cancelSession();
+    const start = nextStage(progress, key);
     setDiffKey(key);
-    setStageIndex(0);
-    setMistakes(0);
-    setWordStatus(null);
-    setSentence(pickFrom(stages[key][0], ''));
-    setResult(makeResult('idle', 'Ready when you are!'));
-    setScreen('game');
-    sendCommand('reset');
+    setStageIndex(start);
+    setRunStars(progress.stars[key].map((s, i) => (i < start ? s : 0)));
+    setSentence(pickFrom(stages[key][start], ''));
+    resetReading();
+    setScreen('play');
   };
 
-  const nextStage = () => {
+  const nextLevel = () => {
+    cancelSession();
+    if (stageIndex === LAST_STAGE) {
+      setScreen('win');
+      sendCommand('win');
+      return;
+    }
     const idx = stageIndex + 1;
-    stopAudio();
     setStageIndex(idx);
-    setWordStatus(null);
     setSentence(pickFrom(stages[diffKey][idx], ''));
-    setResult(makeResult('idle', 'Ready when you are!'));
-    sendCommand('reset');
+    resetReading();
+  };
+
+  const playAgain = () => {
+    cancelSession();
+    setRunStars(new Array(STAGE_COUNT).fill(0));
+    setStageIndex(0);
+    setSentence(pickFrom(stages[diffKey][0], ''));
+    resetReading();
+    setScreen('play');
   };
 
   const swapSentence = () => {
-    stopAudio();
-    setWordStatus(null);
+    cancelSession();
     setSentence((s) => pickFrom(stages[diffKey][stageIndex], s));
-    setResult(makeResult('idle', 'New sentence – you got this!'));
-    sendCommand('reset');
+    resetReading();
   };
 
   const goHome = useCallback(() => {
@@ -795,27 +1076,45 @@ export default function App() {
     const s = sessionRef.current;
     s.active = false;
     s.done = true;
-    clearTimeout(s.silenceTimer);
+    clearTimeout(s.pauseTimer);
     clearTimeout(s.stopTimer);
+    clearTimeout(s.hardTimer);
+    clearTimeout(s.emptyTimer);
     try { Vosk.stop(); } catch {}
     setListening(false);
     setHeard('');
+    setLit(null);
+    setResult(IDLE);
     setScreen('home');
     sendCommand('reset');
   }, [sendCommand]);
 
-  const hearSentence = () => {
-    Speech.stop();
-    Speech.speak(sentence, { language: 'en-US', rate: 0.85 });
+  const openWords = () => {
+    const words = Object.keys(progress.tricky).sort((a, b) => progress.tricky[b].misses - progress.tricky[a].misses);
+    setTrickyWord(words[0] || null);
+    setResult(IDLE);
+    setScreen('words');
   };
 
-  const hearWord = (word) => {
-    if (!word) return;
-    Speech.stop();
-    Speech.speak(word, { language: 'en-US', rate: 0.75 });
+  const selectWord = (w) => {
+    cancelSession();
+    setTrickyWord(w);
+    setResult(IDLE);
   };
 
-  // Android back button goes to the menu instead of closing the app
+  const speak = (text, slow) => {
+    if (!text) return;
+    Speech.stop();
+    Speech.speak(text, { language: 'en-US', rate: slow || settings.slowVoice ? 0.55 : 0.9 });
+  };
+
+  const eraseProgress = () =>
+    Alert.alert('Erase progress?', 'Your stars, points, streak and tricky words will be removed.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Erase', style: 'destructive', onPress: () => update((p) => ({ ...defaultProgress(), settings: p.settings })) },
+    ]);
+
+  // Android back button goes home instead of closing the app
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
       if (screen !== 'home') {
@@ -830,50 +1129,83 @@ export default function App() {
   const diffIndex = DIFFICULTIES.findIndex((d) => d.key === diffKey);
   const nextDiff = DIFFICULTIES[diffIndex + 1] ?? null;
 
+  if (!fontsLoaded && !fontError) {
+    return (
+      <View style={[styles.root, { alignItems: 'center', justifyContent: 'center' }]}>
+        <Image source={LOGO} style={{ width: 96, height: 96 }} />
+      </View>
+    );
+  }
+
   return (
     <View style={styles.root}>
-      <StatusBar style="light" />
+      <StatusBar style="dark" />
       {screen === 'home' && (
         <HomeScreen
-          bleState={bleState}
-          onBle={connectBluetooth}
+          progress={progress}
           engine={engine}
           engineError={engineError}
           onRetryEngine={loadEngine}
-          mode={mode}
-          onMode={setMode}
+          bleState={bleState}
           onStart={startGame}
-          completed={completed}
+          onWords={openWords}
+          onSettings={() => setScreen('settings')}
         />
       )}
-      {screen === 'game' && (
-        <GameScreen
+      {screen === 'play' && (
+        <PlayScreen
           diff={diff}
           stageIndex={stageIndex}
+          runStars={runStars}
           sentence={sentence}
-          wordStatus={wordStatus}
+          marks={marks}
+          lit={lit}
+          heardFor={heardFor}
           result={result}
           listening={listening}
           heard={heard}
           engineReady={engine === 'ready'}
-          showPhonetics={showPhonetics}
-          onTogglePhonetics={() => setShowPhonetics((v) => !v)}
-          onMic={toggleListening}
-          onHear={hearSentence}
-          onHearWord={hearWord}
+          settings={settings}
+          onTogglePhonetics={() => changeSettings({ phonetics: !settings.phonetics })}
+          onMic={micForSentence}
+          onHear={(slow) => speak(sentence, slow)}
+          onHearWord={(w) => speak(w, true)}
           onSwap={swapSentence}
-          onNext={nextStage}
+          onNext={nextLevel}
           onBack={goHome}
         />
       )}
       {screen === 'win' && (
         <WinScreen
           diff={diff}
-          mistakes={mistakes}
+          runStars={runStars}
           nextDiff={nextDiff}
-          onAgain={() => startGame(diffKey)}
+          onAgain={playAgain}
           onNextDiff={() => startGame(nextDiff.key)}
           onHome={goHome}
+        />
+      )}
+      {screen === 'words' && (
+        <WordsScreen
+          tricky={progress.tricky}
+          selected={trickyWord}
+          onSelect={selectWord}
+          result={result}
+          listening={listening}
+          engineReady={engine === 'ready'}
+          onMic={micForWord}
+          onHear={speak}
+          onBack={goHome}
+        />
+      )}
+      {screen === 'settings' && (
+        <SettingsScreen
+          settings={settings}
+          onChange={changeSettings}
+          bleState={bleState}
+          onBle={connectBluetooth}
+          onReset={eraseProgress}
+          onBack={goHome}
         />
       )}
     </View>
@@ -881,66 +1213,92 @@ export default function App() {
 }
 
 // ───────────────────────── Styles ─────────────────────────
+const shadow = { elevation: 2, shadowColor: '#12305A', shadowOpacity: 0.08, shadowRadius: 8, shadowOffset: { width: 0, height: 3 } };
+
 const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: C.bg },
-  screen: { padding: 20, paddingTop: 56, paddingBottom: 56, alignItems: 'center' },
+  root: { flex: 1, backgroundColor: C.paper, direction: 'ltr' },
+  screen: { paddingHorizontal: 18, paddingTop: TOP_PAD, paddingBottom: 56 },
+  hint: { color: C.muted, fontSize: 13, lineHeight: 19, marginTop: 3 },
+  sectionTitle: { fontSize: 17, marginTop: 24, marginBottom: 10 },
+  credit: { color: C.muted, fontSize: 12, textAlign: 'center', marginTop: 8 },
+
+  // Header
+  header: { flexDirection: 'row', alignItems: 'center', marginBottom: 16 },
+  headerBack: { width: 40, height: 40, borderRadius: 20, backgroundColor: C.card, alignItems: 'center', justifyContent: 'center', marginRight: 12, borderWidth: 1, borderColor: C.line },
+  headerTitle: { fontSize: 22 },
+  headerSub: { color: C.muted, fontSize: 13, marginTop: 1 },
+  roundBtn: { width: 42, height: 42, borderRadius: 21, backgroundColor: C.card, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: C.line },
 
   // Home
-  logoImg: { width: 110, height: 110, marginBottom: 4 },
-  credit: { color: C.muted, fontSize: 12, textAlign: 'center', marginTop: 2, marginBottom: 4 },
-  topLogo: { width: 38, height: 38 },
-  title: { fontSize: 32, fontWeight: '800', color: C.text, marginTop: 4 },
-  subtitle: { fontSize: 15, color: C.muted, textAlign: 'center', marginTop: 6, marginBottom: 20 },
-  pill: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', backgroundColor: C.card, borderWidth: 1, borderColor: C.border, borderRadius: 30, paddingVertical: 12, paddingHorizontal: 22, width: '100%' },
-  pillText: { color: C.text, fontSize: 14, fontWeight: '600', textAlign: 'center', flexShrink: 1 },
-  engineError: { color: C.bad, fontSize: 12, textAlign: 'center', marginTop: 6 },
-  sectionLabel: { alignSelf: 'flex-start', color: C.muted, fontSize: 12, fontWeight: '700', letterSpacing: 1, marginBottom: 10 },
-  modeRow: { flexDirection: 'row', width: '100%' },
-  modeBtn: { flex: 1, marginHorizontal: 4, paddingVertical: 10, borderRadius: 10, backgroundColor: C.card, borderWidth: 1, borderColor: C.border, alignItems: 'center' },
-  modeBtnActive: { backgroundColor: C.blue, borderColor: C.blue },
-  modeText: { color: C.muted, fontWeight: '700', fontSize: 14 },
-  modeDesc: { color: C.muted, fontSize: 12, textAlign: 'center', marginTop: 8 },
-  diffCard: { flexDirection: 'row', alignItems: 'center', width: '100%', backgroundColor: C.card, borderRadius: 16, borderLeftWidth: 6, padding: 18, marginBottom: 14, elevation: 3 },
-  diffEmoji: { fontSize: 34, marginRight: 14 },
-  diffName: { color: C.text, fontSize: 20, fontWeight: '700' },
-  diffDesc: { color: C.muted, fontSize: 13, marginTop: 2 },
-  diffLevels: { fontSize: 12, fontWeight: '700', marginTop: 6 },
-  diffArrow: { color: C.muted, fontSize: 28, marginLeft: 8 },
+  homeTop: { flexDirection: 'row', alignItems: 'center' },
+  homeLogo: { width: 54, height: 54, marginRight: 12 },
+  appName: { fontSize: 25, letterSpacing: -0.3 },
+  banner: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.tealSoft, borderRadius: 14, padding: 12, marginTop: 14 },
+  todayCard: { backgroundColor: C.ink, borderRadius: 22, padding: 18, marginTop: 18 },
+  todayRow: { flexDirection: 'row', marginBottom: 14 },
+  todayStat: { flex: 1, flexDirection: 'row', alignItems: 'center' },
+  todayNumber: { color: C.white, fontSize: 26, lineHeight: 30 },
+  todayLabel: { color: '#B5C6DC', fontSize: 12 },
+  todayGoal: { color: C.white, fontSize: 14, marginBottom: 8 },
+  diffCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.card, borderRadius: 18, padding: 14, paddingLeft: 0, marginBottom: 12, borderWidth: 1, borderColor: C.line, overflow: 'hidden', ...shadow },
+  diffTab: { width: 8, alignSelf: 'stretch', borderRadius: 4, marginRight: 14, marginLeft: 0 },
+  pips: { flexDirection: 'row', alignItems: 'center', marginTop: 10, flexWrap: 'wrap' },
+  pip: { width: 24, height: 24, borderRadius: 12, borderWidth: 1.5, borderColor: C.line, alignItems: 'center', justifyContent: 'center', marginRight: 5 },
+  wordsRow: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.card, borderRadius: 18, padding: 14, marginTop: 8, borderWidth: 1, borderColor: C.line },
+  wordsIcon: { width: 40, height: 40, borderRadius: 12, backgroundColor: C.tealSoft, alignItems: 'center', justifyContent: 'center', marginRight: 12 },
+  footer: { alignItems: 'center', marginTop: 26 },
+  chip: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.card, borderRadius: 14, paddingVertical: 5, paddingHorizontal: 10, borderWidth: 1, borderColor: C.line },
 
-  // Game
-  topBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', width: '100%', marginBottom: 18 },
-  backBtn: { width: 70 },
-  backText: { color: C.muted, fontSize: 16, fontWeight: '600' },
-  topTitle: { fontSize: 18, fontWeight: '800' },
-  steps: { flexDirection: 'row', alignItems: 'center', marginBottom: 10 },
-  stepDot: { width: 30, height: 30, borderRadius: 15, borderWidth: 2, borderColor: C.border, alignItems: 'center', justifyContent: 'center', backgroundColor: C.card },
-  stepText: { color: C.text, fontWeight: '800' },
-  stepLine: { width: 26, height: 3, backgroundColor: C.border, marginHorizontal: 3, borderRadius: 2 },
-  levelLabel: { color: C.muted, fontSize: 12, fontWeight: '700', letterSpacing: 1, marginBottom: 18 },
-  sentenceCard: { backgroundColor: C.card, borderWidth: 2, borderRadius: 20, paddingVertical: 20, paddingHorizontal: 12, width: '100%', minHeight: 140, alignItems: 'center', justifyContent: 'center', elevation: 4 },
-  wordsWrap: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center' },
-  wordChip: { alignItems: 'center', paddingHorizontal: 6, paddingVertical: 6, marginHorizontal: 2 },
-  wordText: { fontSize: 22, fontWeight: '700' },
-  ipaText: { color: C.muted, fontSize: 13, marginTop: 2 },
-  tapHint: { color: C.muted, fontSize: 12, marginTop: 8 },
-  helperRow: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', marginTop: 12 },
-  helperBtn: { backgroundColor: C.card, borderWidth: 1, borderColor: C.border, borderRadius: 20, paddingVertical: 8, paddingHorizontal: 14, marginHorizontal: 4, marginBottom: 6 },
-  helperText: { color: C.text, fontSize: 13, fontWeight: '600' },
-  micButton: { width: 96, height: 96, borderRadius: 48, alignItems: 'center', justifyContent: 'center', elevation: 8 },
-  micIcon: { fontSize: 40 },
-  micHint: { color: C.muted, fontSize: 14, marginBottom: 10, textAlign: 'center' },
-  heardText: { color: C.text, fontSize: 16, fontStyle: 'italic', textAlign: 'center', marginBottom: 12, minHeight: 22 },
-  resultBox: { width: '100%', borderWidth: 1.5, borderRadius: 14, padding: 14, minHeight: 56, justifyContent: 'center', backgroundColor: C.card },
-  resultText: { fontSize: 15, fontWeight: '700', textAlign: 'center' },
-  nextBtn: { paddingVertical: 15, paddingHorizontal: 30, borderRadius: 30, alignItems: 'center', marginTop: 16 },
-  nextText: { color: '#fff', fontSize: 18, fontWeight: '800' },
-  winSoon: { color: C.good, fontSize: 16, fontWeight: '700', marginTop: 16 },
+  // Play
+  steps: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginBottom: 16 },
+  step: { width: 30, height: 30, borderRadius: 15, borderWidth: 2, borderColor: C.line, backgroundColor: C.card, alignItems: 'center', justifyContent: 'center' },
+  stepLine: { width: 26, height: 3, backgroundColor: C.line, marginHorizontal: 3, borderRadius: 2 },
+  readingCard: { backgroundColor: C.card, borderRadius: 20, borderWidth: 2, paddingVertical: 18, paddingRight: 12, paddingLeft: 34, minHeight: 150, justifyContent: 'center', overflow: 'hidden', ...shadow },
+  marginLine: { position: 'absolute', left: 22, top: 0, bottom: 0, width: 2, backgroundColor: C.margin },
+  wordsWrap: { flexDirection: 'row', flexWrap: 'wrap' },
+  word: { borderRadius: 10, paddingHorizontal: 7, paddingVertical: 5, marginRight: 3, marginBottom: 6 },
+  wordText: { fontSize: 25, lineHeight: 32 },
+  wordSkipped: { textDecorationLine: 'line-through' },
+  ipa: { fontSize: 13, color: C.muted, marginTop: 1, fontFamily: undefined },
+  wordNote: { fontSize: 11, marginTop: 2 },
+  tools: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 14 },
+  mic: { alignItems: 'center', justifyContent: 'center', elevation: 6, shadowColor: '#12305A', shadowOpacity: 0.25, shadowRadius: 10, shadowOffset: { width: 0, height: 5 } },
+  micHint: { color: C.muted, fontSize: 15, textAlign: 'center', marginTop: -4 },
+  heardText: { fontSize: 16, color: C.tealDeep, textAlign: 'center', marginTop: 8, minHeight: 22 },
+  resultCard: { backgroundColor: C.card, borderRadius: 18, borderWidth: 2, padding: 16, marginTop: 16 },
+  resultTop: { flexDirection: 'row', alignItems: 'center', marginBottom: 12 },
+  resultPercent: { fontSize: 40, lineHeight: 46, minWidth: 96 },
+  resultText: { fontSize: 14, lineHeight: 21, color: C.ink, marginTop: 12 },
+  xpChip: { backgroundColor: C.tealSoft, borderRadius: 12, paddingVertical: 5, paddingHorizontal: 10 },
+  legend: { flexDirection: 'row', marginTop: 12 },
+  legendItem: { flexDirection: 'row', alignItems: 'center', marginRight: 14 },
+  legendDot: { width: 9, height: 9, borderRadius: 5, marginRight: 5 },
 
   // Win
-  trophy: { fontSize: 110 },
-  winTitle: { fontSize: 44, fontWeight: '900', letterSpacing: 2, marginTop: 6 },
-  winSub: { color: C.muted, fontSize: 16, marginTop: 6 },
-  starsRow: { flexDirection: 'row', marginTop: 22 },
-  star: { fontSize: 52, marginHorizontal: 6 },
-  winStats: { color: C.text, fontSize: 15, marginTop: 8, marginBottom: 20 },
+  trophy: { width: 128, height: 128, borderRadius: 64, alignItems: 'center', justifyContent: 'center', marginTop: 12 },
+  winTitle: { fontSize: 38, marginTop: 14, textAlign: 'center' },
+  winCard: { alignSelf: 'stretch', backgroundColor: C.card, borderRadius: 18, borderWidth: 1, borderColor: C.line, padding: 16, marginVertical: 18 },
+  winRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 6 },
+
+  // Tricky words
+  emptyCard: { backgroundColor: C.card, borderRadius: 20, borderWidth: 1, borderColor: C.line, padding: 22, alignItems: 'center' },
+  practiceCard: { backgroundColor: C.card, borderRadius: 20, borderWidth: 1, borderColor: C.line, padding: 18, alignItems: 'center', ...shadow },
+  practiceWord: { fontSize: 38, textAlign: 'center' },
+  practiceIpa: { fontSize: 18, color: C.muted, textAlign: 'center', marginTop: 2, fontFamily: undefined },
+  winsRow: { flexDirection: 'row', marginTop: 10 },
+  winDot: { width: 14, height: 14, borderRadius: 7, borderWidth: 2, borderColor: C.line, marginHorizontal: 4 },
+  chipWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  wordChip: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.card, borderRadius: 14, borderWidth: 1, borderColor: C.line, paddingVertical: 9, paddingHorizontal: 12 },
+  wordChipOn: { backgroundColor: C.ink, borderColor: C.ink },
+
+  // Settings
+  settingsCard: { backgroundColor: C.card, borderRadius: 18, borderWidth: 1, borderColor: C.line, padding: 16, marginBottom: 14 },
+  settingsTitle: { fontSize: 16, marginBottom: 10 },
+  segment: { flexDirection: 'row', backgroundColor: C.paper, borderRadius: 12, padding: 4, marginBottom: 6 },
+  segmentItem: { flex: 1, paddingVertical: 9, borderRadius: 9, alignItems: 'center' },
+  segmentItemOn: { backgroundColor: C.ink },
+  toggleRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 4 },
+  switch: { width: 48, height: 28, borderRadius: 14, padding: 4 },
+  switchKnob: { width: 20, height: 20, borderRadius: 10, backgroundColor: C.white },
+  divider: { height: 1, backgroundColor: C.line, marginVertical: 12 },
 });

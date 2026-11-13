@@ -2,5 +2,7 @@ node_modules/
 .expo/
 android/
 ios/
+assets/model-*/
+vosk-model/
 *.apk
 *.log

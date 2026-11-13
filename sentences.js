@@ -1,9 +1,10 @@
 import vocab from './vocab.json';
 
+// color = main color, edge = darker shade used for the bottom edge of buttons
 export const DIFFICULTIES = [
-  { key: 'Beginner',     label: 'Beginner',     emoji: '🌱', color: '#22c55e', desc: 'Short and simple sentences' },
-  { key: 'Intermediate', label: 'Intermediate', emoji: '🔥', color: '#f59e0b', desc: 'Longer sentences, trickier words' },
-  { key: 'Advanced',     label: 'Advanced',     emoji: '🚀', color: '#a855f7', desc: 'Big vocabulary and tongue twisters' },
+  { key: 'Beginner',     label: 'Beginner',     color: '#1C9A5E', edge: '#147647', desc: 'Short, simple sentences' },
+  { key: 'Intermediate', label: 'Intermediate', color: '#D9822B', edge: '#B0651B', desc: 'Longer sentences and trickier words' },
+  { key: 'Advanced',     label: 'Advanced',     color: '#6B4FD8', edge: '#4F37B0', desc: 'Big vocabulary and tongue twisters' },
 ];
 
 export const STAGE_NAMES = ['Warm-up', 'Getting Better', 'Challenge', 'Expert', 'Final Boss'];

@@ -19,8 +19,9 @@ jobs:
         run: |
           missing=0
           for f in App.js index.js checker.js phonetics.js sentences.js vocab.json \
+                   theme.js storage.js ui.js \
                    package.json app.json babel.config.js \
-                   plugins/withSplashColor.js scripts/make-vocab.js \
+                   plugins/withSplashColor.js plugins/withForceLTR.js \
                    assets/logo.png assets/icon.png assets/adaptive-icon.png; do
             if [ ! -f "$f" ]; then echo "MISSING FILE: $f"; missing=1; fi
           done
@@ -46,7 +47,8 @@ jobs:
 
       - name: Check native modules are installed
         run: |
-          for m in react-native-vosk react-native-ble-plx expo-speech expo-status-bar; do
+          for m in react-native-vosk react-native-ble-plx expo-speech expo-status-bar \
+                   expo-file-system expo-font @expo-google-fonts/lexend @expo/vector-icons; do
             test -d "node_modules/$m" || { echo "MISSING PACKAGE: $m - fix package.json"; exit 1; }
           done
 
@@ -75,9 +77,6 @@ jobs:
           test -d vosk-model/model-en-us/am && test -d vosk-model/model-en-us/graph \
             || { echo "Speech model folder looks wrong"; exit 1; }
 
-      - name: Skip sentences the model cannot hear
-        run: node scripts/make-vocab.js vosk-model/model-en-us
-
       # Bundles the JavaScript on its own so errors (missing imports, typos) are readable
       - name: Check JavaScript bundle
         run: npx expo export --platform android --output-dir /tmp/bundle-check
@@ -85,6 +84,14 @@ jobs:
       # ---- Android build ----
       - name: Generate native Android project
         run: npx expo prebuild --platform android --no-install --clean
+
+      - name: Check the app is locked to left-to-right
+        run: |
+          grep -q 'android:supportsRtl="false"' android/app/src/main/AndroidManifest.xml \
+            || { echo "supportsRtl is not false - check plugins/withForceLTR.js and app.json"; exit 1; }
+          grep -rq "allowRTL(this, false)" android/app/src/main/java \
+            || { echo "allowRTL(false) was not added to MainApplication"; exit 1; }
+          echo "Left-to-right lock is in place."
 
       # Put the speech model straight into the app's own assets folder (always packed into the APK)
       - name: Add speech model to the app
